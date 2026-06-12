@@ -1,1 +1,1 @@
-# pysui-seal
+# pysui-crypto

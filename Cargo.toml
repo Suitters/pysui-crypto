@@ -1,0 +1,17 @@
+[package]
+name = "pysui-crypto"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[lib]
+name = "pysui_crypto"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+# SEAL Rust crate dependency to be added after interface review
+
+[dependencies.pyo3]
+version = "0.28.3"
+features = ["abi3-py310"]

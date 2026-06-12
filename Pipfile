@@ -6,6 +6,10 @@ name = "pypi"
 [packages]
 
 [dev-packages]
+maturin = ">=1.13.3"
+twine = ">=6.1.0"
+pkginfo = ">=1.12.0"
+pytest = "*"
 
 [requires]
 python_version = "3.10"

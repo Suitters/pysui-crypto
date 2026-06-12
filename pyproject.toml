@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+
+[project]
+name = "pysui-crypto"
+version = "0.1.0"
+description = "Python extension for Sui SEAL threshold encryption and zkLogin support"
+readme = "README.rst"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Programming Language :: Python",
+]
+
+[project.urls]
+homepage = "https://github.com/FrankC01/pysui-crypto"
+repository = "https://github.com/FrankC01/pysui-crypto"
+changelog = "https://github.com/FrankC01/pysui-crypto/blob/main/CHANGELOG.md"
