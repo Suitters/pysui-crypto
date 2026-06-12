@@ -1,0 +1,13 @@
+
+.DS_Store
+env
+target
+.python-version
+.dist
+notes.txt
+.claude/
+memory/
+CLAUDE.md
+__pycache__/
+*.pyc
+*.pyo
