@@ -6,11 +6,16 @@ edition = "2021"
 
 [lib]
 name = "pysui_crypto"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0"
-# SEAL Rust crate dependency to be added after interface review
+rand = "0.8.6"
+base64ct = { version = "1.8.3", features = ["alloc"] }
+serde_json = "1.0"
+num-bigint = "0.4"
+fastcrypto = "0.1.10"
+fastcrypto-zkp = "0.1.4"
 
 [dependencies.pyo3]
 version = "0.28.3"

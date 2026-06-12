@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin>=1.14,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -18,6 +18,17 @@ classifiers = [
 ]
 
 [project.urls]
-homepage = "https://github.com/FrankC01/pysui-crypto"
-repository = "https://github.com/FrankC01/pysui-crypto"
-changelog = "https://github.com/FrankC01/pysui-crypto/blob/main/CHANGELOG.md"
+homepage = "https://github.com/Suitters/pysui-crypto"
+repository = "https://github.com/Suitters/pysui-crypto"
+changelog = "https://github.com/Suitters/pysui-crypto/blob/main/CHANGELOG.md"
+
+[tool.pylint.MASTER]
+extension-pkg-allow-list = ["pysui_crypto"]
+ignore-patterns = [".*\\.pyi$"]
+
+[tool.pylint.messages_control]
+disable = [
+    "C0114",
+    "C0115",
+    "C0116",
+]
