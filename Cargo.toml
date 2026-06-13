@@ -16,6 +16,7 @@ serde_json = "1.0"
 num-bigint = "0.4"
 fastcrypto = "0.1.10"
 fastcrypto-zkp = "0.1.4"
+bcs = "0.1.4"
 
 [dependencies.pyo3]
 version = "0.28.3"

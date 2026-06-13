@@ -40,19 +40,19 @@ Quick start — zkLogin
 
     import pysui_crypto as pc
 
-    # 1. Generate an ephemeral Ed25519 key pair
+    # 1. Generate an ephemeral key pair (Ed25519 by default; pass as_secp256r1=True for secp256r1)
     kp = pc.generate_ephemeral_keypair()
-    epk = kp["public_key"]       # bytes (32)
-    esk = kp["private_key"]      # bytes (32)
+    epk = kp["public_key"]       # bytes
+    esk = kp["private_key"]      # bytes
 
     # 2. Compute a nonce to embed in the OAuth authorization request
     max_epoch = 100
     randomness = "100681567828351849884072155819400689004"
     nonce = pc.compute_nonce(epk, max_epoch, randomness)
 
-    # 3. After OAuth login, validate the returned JWT
+    # 3. After OAuth login, extract claims from the returned JWT
     jwt = "<id_token from OAuth provider>"
-    iss, sub, aud, jwt_nonce = pc.validate_jwt(jwt)
+    iss, sub, aud, jwt_nonce = pc.extract_jwt_claims(jwt)
 
     # 4. Compute the address seed from the JWT claims and a user-controlled salt
     user_salt = "12345"

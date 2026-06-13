@@ -1,16 +1,18 @@
-use base64ct::{Base64UrlUnpadded, Encoding as _};
+use base64ct::{Base64, Base64UrlUnpadded, Encoding as _};
 use fastcrypto::{
     ed25519::Ed25519KeyPair,
     hash::{Blake2b256, HashFunction},
+    secp256r1::Secp256r1KeyPair,
     traits::{KeyPair, ToFromBytes},
 };
-use fastcrypto_zkp::bn254::utils::{gen_address_seed, get_nonce};
+use fastcrypto_zkp::bn254::{utils::{gen_address_seed, get_nonce}, zk_login::ZkLoginInputs};
 use num_bigint::BigUint;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use rand::thread_rng;
 use serde_json::Value;
+use bcs;
 
 fn build_nonce_key(epk_bytes: &[u8]) -> Vec<u8> {
     let mut key = vec![0x00u8];
@@ -36,17 +38,24 @@ fn hash_zklogin_address(iss: &str, seed_bytes: &[u8]) -> [u8; 32] {
 }
 
 #[pyfunction]
-fn generate_ephemeral_keypair<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+#[pyo3(signature = (as_secp256r1 = false))]
+fn generate_ephemeral_keypair<'py>(py: Python<'py>, as_secp256r1: bool) -> PyResult<Bound<'py, PyDict>> {
     let mut rng = thread_rng();
-    let kp = Ed25519KeyPair::generate(&mut rng);
     let dict = PyDict::new(py);
-    dict.set_item("public_key", PyBytes::new(py, kp.public().as_bytes()))?;
-    dict.set_item("private_key", PyBytes::new(py, kp.private().as_bytes()))?;
+    if as_secp256r1 {
+        let kp = Secp256r1KeyPair::generate(&mut rng);
+        dict.set_item("public_key", PyBytes::new(py, kp.public().as_bytes()))?;
+        dict.set_item("private_key", PyBytes::new(py, kp.private().as_bytes()))?;
+    } else {
+        let kp = Ed25519KeyPair::generate(&mut rng);
+        dict.set_item("public_key", PyBytes::new(py, kp.public().as_bytes()))?;
+        dict.set_item("private_key", PyBytes::new(py, kp.private().as_bytes()))?;
+    }
     Ok(dict)
 }
 
 #[pyfunction]
-fn validate_jwt(jwt: &str) -> PyResult<(String, String, String, String)> {
+fn extract_jwt_claims(jwt: &str) -> PyResult<(String, String, String, String)> {
     let parts: Vec<&str> = jwt.splitn(4, '.').collect();
     if parts.len() != 3 {
         return Err(PyValueError::new_err("JWT must have exactly 3 parts"));
@@ -143,13 +152,43 @@ fn compute_zklogin_address(iss: &str, address_seed: &[u8], legacy: bool) -> PyRe
     Ok(format!("0x{hex}"))
 }
 
+#[pyfunction]
+fn build_zklogin_signature(
+    proof_json: &str,
+    ephemeral_sig: &[u8],
+    address_seed: &[u8],
+    max_epoch: u64,
+) -> PyResult<String> {
+    let seed_int = BigUint::from_bytes_be(address_seed);
+    let seed_str = seed_int.to_str_radix(10);
+
+    let inputs = ZkLoginInputs::from_json(proof_json, &seed_str)
+        .map_err(|e| PyValueError::new_err(format!("Invalid proof JSON: {e}")))?;
+
+    let inputs_bytes = bcs::to_bytes(&inputs)
+        .map_err(|e| PyRuntimeError::new_err(format!("BCS serialization of inputs failed: {e}")))?;
+    let epoch_bytes = bcs::to_bytes(&max_epoch)
+        .map_err(|e| PyRuntimeError::new_err(format!("BCS serialization of max_epoch failed: {e}")))?;
+    let sig_vec: Vec<u8> = ephemeral_sig.to_vec();
+    let sig_bytes = bcs::to_bytes(&sig_vec)
+        .map_err(|e| PyRuntimeError::new_err(format!("BCS serialization of sig failed: {e}")))?;
+
+    let mut authenticator = vec![0x05u8];
+    authenticator.extend_from_slice(&inputs_bytes);
+    authenticator.extend_from_slice(&epoch_bytes);
+    authenticator.extend_from_slice(&sig_bytes);
+
+    Ok(Base64::encode_string(&authenticator))
+}
+
 #[pymodule]
 fn pysui_crypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_ephemeral_keypair, m)?)?;
-    m.add_function(wrap_pyfunction!(validate_jwt, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_jwt_claims, m)?)?;
     m.add_function(wrap_pyfunction!(compute_nonce, m)?)?;
     m.add_function(wrap_pyfunction!(compute_address_seed, m)?)?;
     m.add_function(wrap_pyfunction!(compute_zklogin_address, m)?)?;
+    m.add_function(wrap_pyfunction!(build_zklogin_signature, m)?)?;
     Ok(())
 }
 

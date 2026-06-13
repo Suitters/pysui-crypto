@@ -11,6 +11,7 @@ twine = ">=6.1.0"
 pkginfo = ">=1.12.0"
 pytest = "*"
 ruff = "*"
+mypy = "*"
 
 [requires]
 python_version = "3.10"

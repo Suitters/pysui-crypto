@@ -22,6 +22,15 @@ homepage = "https://github.com/Suitters/pysui-crypto"
 repository = "https://github.com/Suitters/pysui-crypto"
 changelog = "https://github.com/Suitters/pysui-crypto/blob/main/CHANGELOG.md"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+mypy_path = "."
+
 [tool.pylint.MASTER]
 extension-pkg-allow-list = ["pysui_crypto"]
 ignore-patterns = [".*\\.pyi$"]

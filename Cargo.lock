@@ -1779,6 +1779,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64ct",
+ "bcs",
  "fastcrypto",
  "fastcrypto-zkp",
  "num-bigint 0.4.6",
