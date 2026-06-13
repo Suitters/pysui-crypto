@@ -1,57 +1,123 @@
 #!/usr/bin/env python3
 """
-scratch/zklogin_flow.py
+scratch/google_zklogin.py
 
-Self-contained scratch demonstrating the full zkLogin address-derivation flow.
-No OAuth, no network calls, no GCP setup required.
+Full zkLogin flow using a real Google OAuth id_token.
 
-validate_jwt() does not verify the JWT signature, so we construct a minimal
-well-formed JWT with known claims to drive the entire chain.
+Usage:
+    pipenv run python scratch/google_zklogin.py \
+        --credentials ~/Downloads/client_secret.json
 
-Run:
-    pipenv run python scratch/google_zklogin.py
+The script will open a browser for Google sign-in, catch the OAuth callback on
+localhost, exchange the auth code for an id_token, then call the zkLogin proving
+service with the real JWT.
 """
 
+import argparse
 import base64
+import http.server
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
+import webbrowser
 
 import pysui_crypto as pc
 
 PROVER_URL = "https://prover-dev.mystenlabs.com/v1"
 AS_SECP256R1 = False  # toggle to True to use secp256r1 ephemeral key
+OAUTH_PORT = 8085
 
 
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def make_test_jwt(nonce: str) -> str:
-    """Build a minimal JWT with the given nonce embedded in the payload."""
-    header = b64url(
-        json.dumps({"alg": "RS256", "typ": "JWT", "kid": "1"}, separators=(",", ":")).encode()
+def get_id_token(credentials_path: str, nonce: str) -> str:
+    """Perform Google OAuth flow and return the id_token containing the nonce."""
+    with open(credentials_path, encoding="utf-8") as f:
+        creds = json.load(f)
+
+    # Desktop app credentials are nested under "installed"
+    installed = creds.get("installed", creds)
+    client_id = installed["client_id"]
+    client_secret = installed["client_secret"]
+    redirect_uri = f"http://localhost:{OAUTH_PORT}"
+
+    auth_params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email",
+        "nonce": nonce,
+    }
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        + urllib.parse.urlencode(auth_params)
     )
-    payload = b64url(
-        json.dumps(
-            {
-                "iss": "https://accounts.google.com",
-                "sub": "1234567890",
-                "aud": "test-client-id.apps.googleusercontent.com",
-                "nonce": nonce,
-                "iat": 1000000,
-                "exp": 9999999,
-            },
-            separators=(",", ":"),
-        ).encode()
+
+    auth_code: list[str] = []
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # pylint: disable=invalid-name
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            if "code" in params:
+                auth_code.append(params["code"][0])
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Auth complete. You can close this tab.")
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            pass  # suppress server logs
+
+    server = http.server.HTTPServer(("localhost", OAUTH_PORT), CallbackHandler)
+    webbrowser.open(auth_url)
+    print(
+        f"  Opened browser for Google sign-in. "
+        f"Waiting on port {OAUTH_PORT}..."
     )
-    # Signature is ignored by extract_jwt_claims — any non-empty string works.
-    return f"{header}.{payload}.fakesig"
+    server.handle_request()
+    server.server_close()
+
+    if not auth_code:
+        raise RuntimeError("No auth code received from OAuth callback")
+
+    token_body = urllib.parse.urlencode({
+        "code": auth_code[0],
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }).encode()
+
+    token_req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=token_body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(token_req) as resp:
+        token_data = json.loads(resp.read())
+
+    return token_data["id_token"]
 
 
 def main() -> None:
-    # Step 1: Generate ephemeral keypair
+    parser = argparse.ArgumentParser(
+        description="zkLogin scratch — full OAuth flow"
+    )
+    parser.add_argument(
+        "--credentials",
+        required=True,
+        metavar="PATH",
+        help="Path to GCP Desktop app credentials JSON (client_secret_*.json)",
+    )
+    args = parser.parse_args()
+
     key_label = "secp256r1" if AS_SECP256R1 else "Ed25519"
+
+    # Step 1: Generate ephemeral keypair
     print(f"\n--- Step 1: Ephemeral keypair ({key_label}) ---")
     kp = pc.generate_ephemeral_keypair(as_secp256r1=AS_SECP256R1)
     epk: bytes = kp["public_key"]
@@ -66,19 +132,21 @@ def main() -> None:
     print(f"  randomness : {randomness}")
     print(f"  nonce      : {nonce}")
 
-    # Step 3: Build a minimal test JWT with the nonce embedded
-    print("\n--- Step 3: Build test JWT ---")
-    jwt = make_test_jwt(nonce)
-    print(f"  jwt        : {jwt[:60]}...")
+    # Step 3: Obtain real Google id_token with nonce embedded
+    print("\n--- Step 3: Google OAuth → id_token ---")
+    jwt = get_id_token(args.credentials, nonce)
+    print(f"  id_token   : {jwt[:60]}...")
 
-    # Step 4: Extract claims — no signature verification performed
+    # Step 4: Extract claims from real JWT
     print("\n--- Step 4: Extract JWT claims ---")
     iss, sub, aud, jwt_nonce = pc.extract_jwt_claims(jwt)
     print(f"  iss        : {iss}")
     print(f"  sub        : {sub}")
     print(f"  aud        : {aud}")
     print(f"  jwt_nonce  : {jwt_nonce}")
-    assert jwt_nonce == nonce, f"Nonce mismatch: {jwt_nonce!r} != {nonce!r}"
+    assert (
+        jwt_nonce == nonce
+    ), f"Nonce mismatch: {jwt_nonce!r} != {nonce!r}"
     print("  nonce verified OK")
 
     # Step 5: Compute address seed from JWT claims + user-controlled salt
@@ -94,9 +162,9 @@ def main() -> None:
     print(f"  address    : {address}")
 
     # Step 7: Call the ZK proving service
-    # NOTE: This will fail — our JWT has a fake signature. A real OAuth JWT is required.
     print("\n--- Step 7: ZK proving service (prover-dev) ---")
-    flag = 2 if AS_SECP256R1 else 0  # pysui SignatureScheme: ED25519=0, SECP256R1=2
+    # pysui SignatureScheme: ED25519=0, SECP256R1=2
+    flag = 2 if AS_SECP256R1 else 0
     extended_epk = int.from_bytes(bytes([flag]) + epk, "big")
     body = json.dumps({
         "jwt": jwt,
