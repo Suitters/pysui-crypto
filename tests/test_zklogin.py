@@ -1,3 +1,6 @@
+# Copyright (c), Frank V. Castellucci
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Any
 
 import base64
@@ -9,10 +12,13 @@ import pysui_crypto as pc
 
 
 def _b64url(data: dict[str, Any]) -> str:
-    return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+    encoded = base64.urlsafe_b64encode(json.dumps(data).encode())
+    return encoded.rstrip(b"=").decode()
 
 
-def _make_jwt(payload: dict[str, Any], header: dict[str, Any] | None = None) -> str:
+def _make_jwt(
+    payload: dict[str, Any], header: dict[str, Any] | None = None
+) -> str:
     hdr = header or {"alg": "RS256", "kid": "testkey"}
     return f"{_b64url(hdr)}.{_b64url(payload)}.fakesig"
 
@@ -20,7 +26,10 @@ def _make_jwt(payload: dict[str, Any], header: dict[str, Any] | None = None) -> 
 VALID_PAYLOAD: dict[str, Any] = {
     "iss": "https://accounts.google.com",
     "sub": "110463452167303913607",
-    "aud": "575519200555-msop9ep45u2uo98hapqmngv8d84qdc8k.apps.googleusercontent.com",
+    "aud": (
+        "575519200555-msop9ep45u2uo98hapqmngv8d84qdc8k"
+        ".apps.googleusercontent.com"
+    ),
     "nonce": "hTPpgF7XAKbW37rEUS6pEVZqmoI",
 }
 
@@ -81,7 +90,9 @@ class TestExtractJwtClaims:
         assert nonce == VALID_PAYLOAD["nonce"]
 
     def test_aud_as_array_uses_first_element(self) -> None:
-        payload: dict[str, Any] = {**VALID_PAYLOAD, "aud": ["first-aud", "second-aud"]}
+        payload: dict[str, Any] = {
+            **VALID_PAYLOAD, "aud": ["first-aud", "second-aud"]
+        }
         jwt = _make_jwt(payload)
         _, _, aud, _ = pc.extract_jwt_claims(jwt)
         assert aud == "first-aud"
@@ -141,7 +152,9 @@ class TestComputeNonce:
 
 class TestComputeAddressSeed:
     def test_returns_32_bytes(self) -> None:
-        result = pc.compute_address_seed("sub", "110463452167303913607", "test-aud", "12345")
+        result = pc.compute_address_seed(
+            "sub", "110463452167303913607", "test-aud", "12345"
+        )
         assert isinstance(result, bytes)
         assert len(result) == 32
 
@@ -150,8 +163,12 @@ class TestComputeAddressSeed:
         assert pc.compute_address_seed(*args) == pc.compute_address_seed(*args)
 
     def test_different_salt_gives_different_seed(self) -> None:
-        a = pc.compute_address_seed("sub", "110463452167303913607", "test-aud", "12345")
-        b = pc.compute_address_seed("sub", "110463452167303913607", "test-aud", "99999")
+        a = pc.compute_address_seed(
+            "sub", "110463452167303913607", "test-aud", "12345"
+        )
+        b = pc.compute_address_seed(
+            "sub", "110463452167303913607", "test-aud", "99999"
+        )
         assert a != b
 
 
@@ -159,17 +176,25 @@ class TestComputeZkloginAddress:
     seed: bytes
 
     def setup_method(self, _method: object) -> None:
-        self.seed = pc.compute_address_seed("sub", "110463452167303913607", "test-aud", "12345")
+        self.seed = pc.compute_address_seed(
+            "sub", "110463452167303913607", "test-aud", "12345"
+        )
 
     def test_returns_hex_string(self) -> None:
-        addr = pc.compute_zklogin_address("https://accounts.google.com", self.seed, False)
+        addr = pc.compute_zklogin_address(
+            "https://accounts.google.com", self.seed, False
+        )
         assert isinstance(addr, str)
         assert addr.startswith("0x")
         assert len(addr) == 66
 
     def test_legacy_and_non_legacy_differ(self) -> None:
-        non_legacy = pc.compute_zklogin_address("https://accounts.google.com", self.seed, False)
-        legacy = pc.compute_zklogin_address("https://accounts.google.com", self.seed, True)
+        non_legacy = pc.compute_zklogin_address(
+            "https://accounts.google.com", self.seed, False
+        )
+        legacy = pc.compute_zklogin_address(
+            "https://accounts.google.com", self.seed, True
+        )
         assert non_legacy.startswith("0x")
         assert legacy.startswith("0x")
 
@@ -181,11 +206,17 @@ class TestComputeZkloginAddress:
 
     def test_wrong_seed_length_raises(self) -> None:
         with pytest.raises(ValueError):
-            pc.compute_zklogin_address("https://accounts.google.com", b"\x00" * 31, False)
+            pc.compute_zklogin_address(
+                "https://accounts.google.com", b"\x00" * 31, False
+            )
 
     def test_different_iss_gives_different_address(self) -> None:
-        a = pc.compute_zklogin_address("https://accounts.google.com", self.seed, False)
-        b = pc.compute_zklogin_address("https://accounts.facebook.com", self.seed, False)
+        a = pc.compute_zklogin_address(
+            "https://accounts.google.com", self.seed, False
+        )
+        b = pc.compute_zklogin_address(
+            "https://accounts.facebook.com", self.seed, False
+        )
         assert a != b
 
 
@@ -193,7 +224,9 @@ class TestBuildZkloginSignature:
     seed: bytes
 
     def setup_method(self, _method: object) -> None:
-        self.seed = pc.compute_address_seed("sub", "110463452167303913607", "test-aud", "12345")
+        self.seed = pc.compute_address_seed(
+            "sub", "110463452167303913607", "test-aud", "12345"
+        )
 
     def test_invalid_json_raises(self) -> None:
         with pytest.raises(ValueError, match="Invalid proof JSON"):
@@ -202,4 +235,3 @@ class TestBuildZkloginSignature:
     def test_empty_object_json_raises(self) -> None:
         with pytest.raises(ValueError, match="Invalid proof JSON"):
             pc.build_zklogin_signature("{}", b"\x00" * 64, self.seed, 100)
-

@@ -14,9 +14,16 @@ rand = "0.8.6"
 base64ct = { version = "1.8.3", features = ["alloc"] }
 serde_json = "1.0"
 num-bigint = "0.4"
-fastcrypto = "0.1.10"
+fastcrypto = { version = "0.1.10", features = ["aes"] }
 fastcrypto-zkp = "0.1.4"
 bcs = "0.1.4"
+serde = { version = "1", features = ["derive"] }
+serde_with = "3.21.0"
+itertools = "0.14.0"
+chrono = "0.4"
+hex = "0.4"
+typenum = "1.20.1"
+zeroize = { version = "1", features = ["derive"] }
 
 [dependencies.pyo3]
 version = "0.28.3"

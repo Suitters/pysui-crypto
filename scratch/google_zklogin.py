@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c), Frank V. Castellucci
+# SPDX-License-Identifier: Apache-2.0
 """
 scratch/google_zklogin.py
 

@@ -1,0 +1,296 @@
+// Copyright (c), Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+#![allow(dead_code)]
+
+//! Implementation of a the Boneh-Franklin Identity-based encryption scheme from https://eprint.iacr.org/2001/090 over the BLS12-381 curve construction.
+//! It enables a symmetric key to be derived from the identity + the public key of a user and used to encrypt a fixed size message of length [KEY_SIZE].
+
+use super::elgamal::{Encryption, VerificationKey};
+use super::utils::{generate_random_bytes, xor};
+use super::core::{DST_ID, DST_KDF, DST_POP, KEY_SIZE};
+use super::ObjectID;
+use fastcrypto::error::FastCryptoError::{GeneralError, InvalidInput};
+use fastcrypto::error::FastCryptoResult;
+use fastcrypto::groups::bls12381::{G1Element, G2Element, GTElement, Scalar};
+use fastcrypto::groups::{
+    bls12381, GroupElement, HashToGroupElement, Pairing, Scalar as GenericScalar,
+};
+use fastcrypto::hash::{HashFunction, Sha3_256};
+use fastcrypto::hmac::{hkdf_sha3_256, HkdfIkm};
+use fastcrypto::serde_helpers::ToFromByteArray;
+use fastcrypto::traits::{AllowedRng, ToFromBytes};
+
+pub type MasterKey = Scalar;
+pub type PublicKey = G2Element;
+pub type UserSecretKey = G1Element;
+pub type Nonce = G2Element;
+pub type Plaintext = [u8; KEY_SIZE];
+pub type Ciphertext = [u8; KEY_SIZE];
+pub type Randomness = Scalar;
+pub type EncryptedRandomness = [u8; KEY_SIZE];
+
+// Additional info for the key derivation. Contains the object id for the key server and the share index.
+pub type Info = (ObjectID, u8);
+
+pub const SEED_LENGTH: usize = 32;
+pub const MASTER_KEY_LENGTH: usize = bls12381::SCALAR_LENGTH;
+
+/// Generate a key pair consisting of a master key and a public key.
+pub fn generate_key_pair<R: AllowedRng>(rng: &mut R) -> (MasterKey, PublicKey) {
+    into_key_pair(MasterKey::rand(rng))
+}
+
+/// Derive a public key from a master key.
+pub fn public_key_from_master_key(master_key: &MasterKey) -> PublicKey {
+    G2Element::generator() * master_key
+}
+
+/// Create a key pair from a master key. See also [public_key_from_master_key].
+pub fn into_key_pair(master_key: MasterKey) -> (MasterKey, PublicKey) {
+    (master_key, public_key_from_master_key(&master_key))
+}
+
+/// Generate a fresh seed of length [SEED_LENGTH] using the provided random number generator.
+pub fn generate_seed<R: AllowedRng>(rng: &mut R) -> [u8; SEED_LENGTH] {
+    generate_random_bytes(rng)
+}
+
+/// Derive a key pair from a seed (master key) and a derivation index.
+pub fn derive_master_key(seed: &[u8], derivation_index: u64) -> MasterKey {
+    let hkdf_ikm = HkdfIkm::from_bytes(seed).expect("no length requirement");
+
+    // Derive 64 bytes to reduce the bias of rounding
+    let random_bytes =
+        hkdf_sha3_256(&hkdf_ikm, &[], &derivation_index.to_be_bytes(), 64).expect("valid length");
+
+    bls12381::buffer_to_scalar_mod_r(&random_bytes).expect("valid length")
+}
+
+/// Extract a user secret key from a master key and an id.
+pub fn extract(master_key: &MasterKey, id: &[u8]) -> UserSecretKey {
+    hash_to_g1(id) * master_key
+}
+
+/// Verify that a user secret key is valid for a given public key and id.
+pub fn verify_user_secret_key(
+    user_secret_key: &UserSecretKey,
+    id: &[u8],
+    public_key: &PublicKey,
+) -> FastCryptoResult<()> {
+    if user_secret_key.pairing(&G2Element::generator()) == hash_to_g1(id).pairing(public_key) {
+        Ok(())
+    } else {
+        Err(InvalidInput)
+    }
+}
+
+/// Verify an encrypted signature share from a committee member.
+/// Checks: e(encsig_2, g2) = e(encsig_1, ephpk_2) * e(H(ID), pk_i)
+pub fn verify_encrypted_signature(
+    encrypted_sig: &Encryption<G1Element>,
+    ephemeral_vk: &VerificationKey<G2Element>,
+    partial_pk: &G2Element,
+    id: &[u8],
+) -> FastCryptoResult<()> {
+    // Validate no identity elements.
+    if encrypted_sig.0 == G1Element::zero()
+        || encrypted_sig.1 == G1Element::zero()
+        || *ephemeral_vk.as_element() == G2Element::zero()
+        || *partial_pk == G2Element::zero()
+    {
+        return Err(InvalidInput);
+    }
+
+    let lhs = encrypted_sig.1.pairing(&G2Element::generator());
+    let rhs =
+        encrypted_sig.0.pairing(ephemeral_vk.as_element()) + hash_to_g1(id).pairing(partial_pk);
+
+    if lhs == rhs {
+        Ok(())
+    } else {
+        Err(InvalidInput)
+    }
+}
+
+/// Encrypt a set of messages for a given identity but different public keys.
+/// The infos are used to derive the symmetric keys for the encryption.
+pub fn encrypt_batched_deterministic(
+    randomness: &Randomness,
+    plaintexts: &[Plaintext],
+    public_keys: &[PublicKey],
+    id: &[u8],
+    infos: &[Info],
+) -> FastCryptoResult<(Nonce, Vec<Ciphertext>)> {
+    let batch_size = plaintexts.len();
+    if batch_size != public_keys.len() || batch_size != infos.len() {
+        return Err(InvalidInput);
+    }
+
+    let gid = hash_to_g1(id);
+    let gid_r = gid * randomness;
+    let nonce = G2Element::generator() * randomness;
+    Ok((
+        nonce,
+        (0..batch_size)
+            .map(|i| {
+                xor(
+                    &kdf(&gid_r.pairing(&public_keys[i]), &nonce, &gid, &infos[i]),
+                    &plaintexts[i],
+                )
+            })
+            .collect(),
+    ))
+}
+
+/// Decrypt a message with the given user secret key and the encapsulation.
+/// The info is used to derive the symmetric key for the decryption and should be the same as the one used for the encryption.
+pub fn decrypt(
+    nonce: &Nonce,
+    ciphertext: &Ciphertext,
+    secret_key: &UserSecretKey,
+    id: &[u8],
+    info: &Info,
+) -> Plaintext {
+    let gid = hash_to_g1(id);
+    xor(
+        ciphertext,
+        &kdf(&secret_key.pairing(nonce), nonce, &gid, info),
+    )
+}
+
+/// Verify that the given randomness was used to crate the nonce.
+pub fn verify_nonce(randomness: &Randomness, nonce: &Nonce) -> FastCryptoResult<()> {
+    if G2Element::generator() * randomness != *nonce {
+        return Err(GeneralError("Invalid randomness".to_string()));
+    }
+    Ok(())
+}
+
+/// Decrypt a message using given randomness.
+/// The info is used to derive the symmetric key for the decryption and should be the same as the one used for the encryption.
+pub fn decrypt_deterministic(
+    randomness: &Randomness,
+    ciphertext: &Ciphertext,
+    public_key: &PublicKey,
+    id: &[u8],
+    info: &Info,
+) -> FastCryptoResult<Plaintext> {
+    let gid = hash_to_g1(id);
+    let gid_r = gid * randomness;
+    let nonce = G2Element::generator() * randomness;
+    Ok(xor(
+        ciphertext,
+        &kdf(&gid_r.pairing(public_key), &nonce, &gid, info),
+    ))
+}
+
+pub(crate) fn hash_to_g1(id: &[u8]) -> G1Element {
+    G1Element::hash_to_group_element(&[DST_ID, id].concat())
+}
+
+/// Derive a random key from public inputs.
+fn kdf(
+    input: &GTElement,
+    nonce: &G2Element,
+    gid: &G1Element,
+    (object_id, index): &Info,
+) -> [u8; KEY_SIZE] {
+    let mut hash = Sha3_256::new();
+    hash.update(DST_KDF);
+    hash.update(input.to_byte_array());
+    hash.update(nonce.to_byte_array());
+    hash.update(gid.to_byte_array());
+    hash.update(object_id.as_bytes());
+    hash.update([*index]);
+    hash.finalize().digest
+}
+
+/// Encrypt the Randomness using a key.
+pub fn encrypt_randomness(randomness: &Randomness, key: &[u8; KEY_SIZE]) -> EncryptedRandomness {
+    xor(key, &randomness.to_byte_array())
+}
+
+/// Decrypt the Randomness using a key and verify that the randomness was used to create the given nonce.
+pub fn decrypt_randomness(
+    encrypted_randomness: &EncryptedRandomness,
+    derived_key: &[u8; KEY_SIZE],
+) -> FastCryptoResult<Randomness> {
+    Scalar::from_byte_array(&xor(derived_key, encrypted_randomness))
+}
+
+pub type ProofOfPossession = G1Element;
+
+/// Create a proof-of-possession of the master key, binding it to a specific message.
+/// It is created as a BLS signature over the public key and the message.
+pub fn create_proof_of_possession(master_key: &MasterKey, message: &[u8]) -> ProofOfPossession {
+    let public_key = public_key_from_master_key(master_key);
+    let mut full_msg = DST_POP.to_vec();
+    full_msg.extend(bcs::to_bytes(&public_key).expect("valid pk"));
+    full_msg.extend(message);
+    G1Element::hash_to_group_element(&full_msg) * master_key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::seal::elgamal;
+    use rand::thread_rng;
+
+    #[test]
+    fn test_kdf_regression() {
+        use fastcrypto::groups::GroupElement;
+
+        let r = fastcrypto::groups::bls12381::Scalar::from(12345u128);
+        let x = GTElement::generator() * r;
+        let nonce = G2Element::generator() * r;
+        let gid = hash_to_g1(&[0]);
+        let object_id = ObjectID::new([0; 32]);
+
+        let derived_key = kdf(&x, &nonce, &gid, &(object_id, 42));
+        let expected =
+            hex::decode("89befdfd6aecdce1305ddbca891d1c29f0507cfd5225cd6b11e52e60f088ea87")
+                .unwrap();
+        assert_eq!(expected, derived_key);
+    }
+
+    #[test]
+    fn test_derive_key_regression() {
+        let seed = [1u8; 32];
+        let derivation_index = 42;
+        let expected_master_key = MasterKey::from_byte_array(
+            &hex::decode("17d496df95e12b5caec0c4a15b09a5ea41b4fb1cf3ba28f1c6c72556846a6db6")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            expected_master_key,
+            derive_master_key(&seed, derivation_index)
+        );
+    }
+
+    #[test]
+    fn test_encrypted_signature_verification() {
+        let master_share = MasterKey::rand(&mut thread_rng());
+        let partial_pk = public_key_from_master_key(&master_share);
+
+        let (_eg_sk, eg_pk, eg_vk) = elgamal::genkey::<G1Element, G2Element, _>(&mut thread_rng());
+
+        let id = b"test_id";
+        let usk = extract(&master_share, id);
+
+        // Encrypt the user secret key.
+        let encrypted_key = elgamal::encrypt(&mut thread_rng(), &usk, &eg_pk);
+
+        // Verify the encrypted signature ok.
+        let result = verify_encrypted_signature(&encrypted_key, &eg_vk, &partial_pk, id);
+        assert!(result.is_ok());
+
+        // Verify with wrong id should fail.
+        let wrong_id = b"wrong_id";
+        let result = verify_encrypted_signature(&encrypted_key, &eg_vk, &partial_pk, wrong_id);
+        assert!(result.is_err());
+    }
+}

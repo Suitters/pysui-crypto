@@ -1,3 +1,6 @@
+// Copyright (c), Frank V. Castellucci
+// SPDX-License-Identifier: Apache-2.0
+
 use base64ct::{Base64, Base64UrlUnpadded, Encoding as _};
 use fastcrypto::{
     ed25519::Ed25519KeyPair,
@@ -9,6 +12,9 @@ use fastcrypto_zkp::bn254::{utils::{gen_address_seed, get_nonce}, zk_login::ZkLo
 use num_bigint::BigUint;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use zeroize::Zeroizing;
+
+mod seal;
 use pyo3::types::{PyBytes, PyDict};
 use rand::thread_rng;
 use serde_json::Value;
@@ -44,12 +50,16 @@ fn generate_ephemeral_keypair<'py>(py: Python<'py>, as_secp256r1: bool) -> PyRes
     let dict = PyDict::new(py);
     if as_secp256r1 {
         let kp = Secp256r1KeyPair::generate(&mut rng);
-        dict.set_item("public_key", PyBytes::new(py, kp.public().as_bytes()))?;
-        dict.set_item("private_key", PyBytes::new(py, kp.private().as_bytes()))?;
+        let pk_bytes = kp.public().as_bytes().to_vec();
+        let sk_bytes = Zeroizing::new(kp.private().as_bytes().to_vec());
+        dict.set_item("public_key", PyBytes::new(py, &pk_bytes))?;
+        dict.set_item("private_key", PyBytes::new(py, &sk_bytes))?;
     } else {
         let kp = Ed25519KeyPair::generate(&mut rng);
-        dict.set_item("public_key", PyBytes::new(py, kp.public().as_bytes()))?;
-        dict.set_item("private_key", PyBytes::new(py, kp.private().as_bytes()))?;
+        let pk_bytes = kp.public().as_bytes().to_vec();
+        let sk_bytes = Zeroizing::new(kp.private().as_bytes().to_vec());
+        dict.set_item("public_key", PyBytes::new(py, &pk_bytes))?;
+        dict.set_item("private_key", PyBytes::new(py, &sk_bytes))?;
     }
     Ok(dict)
 }
@@ -81,6 +91,12 @@ fn extract_jwt_claims(jwt: &str) -> PyResult<(String, String, String, String)> {
         .as_str()
         .ok_or_else(|| PyValueError::new_err("Missing required claim 'iss'"))?
         .to_string();
+    if iss.len() > 255 {
+        return Err(PyValueError::new_err(format!(
+            "'iss' claim exceeds 255 characters (got {})",
+            iss.len()
+        )));
+    }
     let sub = payload["sub"]
         .as_str()
         .ok_or_else(|| PyValueError::new_err("Missing required claim 'sub'"))?
@@ -189,6 +205,7 @@ fn pysui_crypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_address_seed, m)?)?;
     m.add_function(wrap_pyfunction!(compute_zklogin_address, m)?)?;
     m.add_function(wrap_pyfunction!(build_zklogin_signature, m)?)?;
+    seal::bindings::register_seal(m)?;
     Ok(())
 }
 
