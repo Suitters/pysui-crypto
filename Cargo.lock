@@ -930,9 +930,8 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "fastcrypto"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7d0311319519303515667f714eb6d2d6363843c1d569e7e05a69f2e163a2f81"
+version = "0.1.9"
+source = "git+https://github.com/MystenLabs/fastcrypto.git?rev=c6010b9080b00e29d039a48c08898d90c2c1cbdd#c6010b9080b00e29d039a48c08898d90c2c1cbdd"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -992,9 +991,8 @@ dependencies = [
 
 [[package]]
 name = "fastcrypto-derive"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea839b19e2241156eb78b1c33066df25266e893ba85a6b283ceb3bd8a1a6d21b"
+version = "0.1.3"
+source = "git+https://github.com/MystenLabs/fastcrypto.git?rev=c6010b9080b00e29d039a48c08898d90c2c1cbdd#c6010b9080b00e29d039a48c08898d90c2c1cbdd"
 dependencies = [
  "quote",
  "syn 1.0.109",
@@ -1002,9 +1000,8 @@ dependencies = [
 
 [[package]]
 name = "fastcrypto-zkp"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63d67851a1740bc5598fc893c7501894cab03c690f54f34d3162bbff4b15d76a"
+version = "0.1.3"
+source = "git+https://github.com/MystenLabs/fastcrypto.git?rev=c6010b9080b00e29d039a48c08898d90c2c1cbdd#c6010b9080b00e29d039a48c08898d90c2c1cbdd"
 dependencies = [
  "ark-bn254",
  "ark-ec",

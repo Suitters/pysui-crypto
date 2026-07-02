@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use zeroize::Zeroizing;
 
 mod seal;
+mod ct;
 use pyo3::types::{PyBytes, PyDict};
 use rand::thread_rng;
 use serde_json::Value;
@@ -197,6 +198,21 @@ fn build_zklogin_signature(
     Ok(Base64::encode_string(&authenticator))
 }
 
+/// Return the installed pysui-crypto version as a `(major, minor, patch)` tuple.
+#[pyfunction]
+fn pysui_crypto_version() -> (u32, u32, u32) {
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    let mut parts = VERSION.split('.');
+    let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let patch: u32 = parts
+        .next()
+        .map(|s| s.split(|c: char| !c.is_ascii_digit()).next().unwrap_or(""))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (major, minor, patch)
+}
+
 #[pymodule]
 fn pysui_crypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_ephemeral_keypair, m)?)?;
@@ -205,7 +221,9 @@ fn pysui_crypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_address_seed, m)?)?;
     m.add_function(wrap_pyfunction!(compute_zklogin_address, m)?)?;
     m.add_function(wrap_pyfunction!(build_zklogin_signature, m)?)?;
+    m.add_function(wrap_pyfunction!(pysui_crypto_version, m)?)?;
     seal::bindings::register_seal(m)?;
+    ct::bindings::register_ct(m)?;
     Ok(())
 }
 

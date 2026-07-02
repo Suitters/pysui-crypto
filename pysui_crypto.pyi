@@ -14,6 +14,7 @@ def build_zklogin_signature(
     address_seed: bytes,
     max_epoch: int,
 ) -> str: ...
+def pysui_crypto_version() -> tuple[int, int, int]: ...
 
 class DemType:
     AesGcm256: DemType
@@ -64,3 +65,35 @@ def seal_signed_message(
     creation_time: int,
     ttl_min: int,
 ) -> str: ...
+
+def generate_twisted_elgamal_keypair() -> dict[str, bytes]: ...
+
+class BsgsTable:
+    @staticmethod
+    def precompute() -> BsgsTable: ...
+    def __len__(self) -> int: ...
+
+def decrypt_balance(
+    private_key: bytes, encrypted_amount: bytes, table: BsgsTable
+) -> int: ...
+
+def subtract_encrypted(balance: bytes, amount: bytes) -> bytes: ...
+
+def encrypt_amount_with_proofs(
+    recipient_public_key: bytes, amount: int, session_id: bytes
+) -> dict[str, bytes]: ...
+
+def register_with_auditors(
+    private_key: bytes,
+    auditor_public_keys: list[bytes],
+    session_id: bytes,
+    version: int,
+) -> dict[str, bytes]: ...
+
+def unwrap_proof(
+    sender_private_key: bytes,
+    sender_public_key: bytes,
+    commitment: bytes,
+    decryption_handle: bytes,
+    session_id: bytes,
+) -> bytes: ...
