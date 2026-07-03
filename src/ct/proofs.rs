@@ -19,10 +19,24 @@ use fastcrypto::pedersen::Blinding;
 use fastcrypto::serde_helpers::ToFromByteArray;
 use fastcrypto::twisted_elgamal::{Ciphertext, PublicKey};
 use rand::{thread_rng, RngCore};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Number of `u32` limbs a 32-byte private key is split into (fastcrypto `N`).
 pub const KEY_LIMB_COUNT: usize = 8;
+
+/// Owns a `Vec<Blinding>` and zeroizes each blinding's inner scalar on drop, so
+/// the secret range-proof randomness is scrubbed on every exit path — `?`
+/// early-returns and panic unwinds included, not just the happy path. `Blinding`
+/// itself doesn't derive `Zeroize`, but its public `.0` `RistrettoScalar` does.
+struct ScrubbedBlindings(Vec<Blinding>);
+
+impl Drop for ScrubbedBlindings {
+    fn drop(&mut self) {
+        for b in self.0.iter_mut() {
+            b.0.zeroize();
+        }
+    }
+}
 
 /// Sample a uniform ristretto scalar via wide reduction of 64 random bytes.
 fn rand_scalar() -> RistrettoScalar {
@@ -67,12 +81,14 @@ impl KeyConsistencyProof {
         decryption_handles: &[Vec<RistrettoPoint>; KEY_LIMB_COUNT],
         blindings: &[RistrettoScalar; KEY_LIMB_COUNT],
     ) -> Self {
-        let a: [RistrettoScalar; KEY_LIMB_COUNT] = std::array::from_fn(|_| rand_scalar());
-        let b: [RistrettoScalar; KEY_LIMB_COUNT] = std::array::from_fn(|_| rand_scalar());
+        let a: Zeroizing<[RistrettoScalar; KEY_LIMB_COUNT]> =
+            Zeroizing::new(std::array::from_fn(|_| rand_scalar()));
+        let b: Zeroizing<[RistrettoScalar; KEY_LIMB_COUNT]> =
+            Zeroizing::new(std::array::from_fn(|_| rand_scalar()));
 
         // a1[i*m + j] = a_i * pk_j, limb-major then recipient.
         let mut a1 = Vec::with_capacity(KEY_LIMB_COUNT * recipient_public_keys.len());
-        for ai in &a {
+        for ai in a.iter() {
             for pk in recipient_public_keys {
                 a1.push(*pk * *ai);
             }
@@ -85,11 +101,12 @@ impl KeyConsistencyProof {
         let base = RistrettoScalar::from(1u64 << 32);
         let mut weight = RistrettoScalar::from(1u64);
         let mut b_weighted = RistrettoScalar::zero();
-        for bi in &b {
+        for bi in b.iter() {
             b_weighted += *bi * weight;
             weight *= base;
         }
         let a3 = g() * b_weighted;
+        b_weighted.zeroize();
 
         let c = Self::challenge(
             dst,
@@ -253,11 +270,11 @@ pub fn register_with_auditors(
     // DST = session_id ‖ 0x05 (RANGE_PROOF_32).
     let mut dst_rp = session_id.to_vec();
     dst_rp.push(0x05);
-    let values: Vec<u64> = limbs.iter().map(|&l| l as u64).collect();
-    let range_blindings: Vec<Blinding> = blindings.iter().map(|r| Blinding(*r)).collect();
+    let values: Zeroizing<Vec<u64>> = Zeroizing::new(limbs.iter().map(|&l| l as u64).collect());
+    let range_blindings = ScrubbedBlindings(blindings.iter().map(|r| Blinding(*r)).collect());
     let range_proof = RangeProof::prove_batch(
         &values,
-        &range_blindings,
+        &range_blindings.0,
         &Range::Bits32,
         &dst_rp,
         &mut thread_rng(),
@@ -310,7 +327,7 @@ pub fn encrypt_amount_with_proofs(
 
     let mut encrypted_amount = Vec::with_capacity(256);
     let mut consistency_proof = Vec::with_capacity(512);
-    let mut blindings: Vec<Blinding> = Vec::with_capacity(4);
+    let mut blindings = ScrubbedBlindings(Vec::with_capacity(4));
     for &limb in &limbs {
         let (ciphertext, blinding, proof) = Ciphertext::encrypt_with_consistency_proof(
             &encryption_key,
@@ -322,16 +339,16 @@ pub fn encrypt_amount_with_proofs(
             .extend_from_slice(&bcs::to_bytes(&ciphertext).expect("serialize ciphertext"));
         consistency_proof
             .extend_from_slice(&bcs::to_bytes(&proof).expect("serialize consistency proof"));
-        blindings.push(blinding);
+        blindings.0.push(blinding);
     }
 
     // Aggregated 16-bit range proof over the four limbs, DST = session_id ‖ 0x04.
     let mut dst_rp = session_id.to_vec();
     dst_rp.push(0x04);
-    let values: Vec<u64> = limbs.iter().map(|&l| l as u64).collect();
+    let values: Zeroizing<Vec<u64>> = Zeroizing::new(limbs.iter().map(|&l| l as u64).collect());
     let range_proof = RangeProof::prove_batch(
         &values,
-        &blindings,
+        &blindings.0,
         &Range::Bits16,
         &dst_rp,
         &mut thread_rng(),

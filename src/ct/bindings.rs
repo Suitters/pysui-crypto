@@ -51,14 +51,15 @@ fn generate_twisted_elgamal_keypair<'py>(py: Python<'py>) -> PyResult<Bound<'py,
 }
 
 /// Parse a canonical 32-byte little-endian private key into a scalar.
-fn private_key_from_bytes(bytes: &[u8]) -> PyResult<RistrettoScalar> {
+fn private_key_from_bytes(bytes: &[u8]) -> PyResult<Zeroizing<RistrettoScalar>> {
     let arr: Zeroizing<[u8; 32]> = Zeroizing::new(
         bytes
             .try_into()
             .map_err(|_| PyValueError::new_err("private_key must be exactly 32 bytes"))?,
     );
-    RistrettoScalar::from_byte_array(&arr)
-        .map_err(|e| PyValueError::new_err(format!("invalid private key: {e:?}")))
+    let scalar = RistrettoScalar::from_byte_array(&arr)
+        .map_err(|e| PyValueError::new_err(format!("invalid private key: {e:?}")))?;
+    Ok(Zeroizing::new(scalar))
 }
 
 /// Map a fastcrypto error to a Python `ValueError`.
