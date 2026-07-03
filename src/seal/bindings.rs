@@ -102,8 +102,7 @@ impl PyEncryptedObject {
 /// Accepts 0x-prefixed 32-byte hex addresses and MVR names (starting with '@').
 /// Rejects strings containing commas, which would break the fixed message format.
 fn validate_package_id(s: &str) -> PyResult<()> {
-    if s.starts_with("0x") {
-        let hex_part = &s[2..];
+    if let Some(hex_part) = s.strip_prefix("0x") {
         if hex_part.len() != 64 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "package_id starting with '0x' must be exactly 66 characters (0x + 64 hex digits)",
@@ -119,6 +118,7 @@ fn validate_package_id(s: &str) -> PyResult<()> {
 
 #[pyfunction]
 #[pyo3(signature = (package_id, id, key_servers, public_keys, threshold, data, dem_type, aad=None))]
+#[allow(clippy::too_many_arguments)]
 fn seal_encrypt(
     package_id: &[u8],
     id: Vec<u8>,

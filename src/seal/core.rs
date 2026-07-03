@@ -281,6 +281,7 @@ pub enum KeyPurpose {
     /// The key used to encrypt the encryption randomness.
     EncryptedRandomness,
     /// The key used by the DEM.
+    #[allow(clippy::upper_case_acronyms)]
     DEM,
 }
 

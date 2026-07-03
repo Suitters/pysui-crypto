@@ -485,6 +485,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn key_consistency_proof_satisfies_sigma_equations() {
         let dst = [0x03u8; 21];
         // Sender key and its limb decomposition.
@@ -552,7 +553,7 @@ mod tests {
         let mut z2_weighted = RistrettoScalar::zero();
         for i in 0..KEY_LIMB_COUNT {
             z2_weighted += proof.z2[i] * weight;
-            weight = weight * base;
+            weight *= base;
         }
         let lhs = g() * z2_weighted;
         let rhs = proof.a3 + sender_pk * c;

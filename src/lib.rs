@@ -19,7 +19,6 @@ mod ct;
 use pyo3::types::{PyBytes, PyDict};
 use rand::thread_rng;
 use serde_json::Value;
-use bcs;
 
 fn build_nonce_key(epk_bytes: &[u8]) -> Vec<u8> {
     let mut key = vec![0x00u8];
@@ -37,8 +36,8 @@ fn strip_seed_leading_zeros(seed: &[u8]) -> &[u8] {
 fn hash_zklogin_address(iss: &str, seed_bytes: &[u8]) -> [u8; 32] {
     let iss_bytes = iss.as_bytes();
     let mut hasher = Blake2b256::default();
-    hasher.update(&[0x05u8]);
-    hasher.update(&[iss_bytes.len() as u8]);
+    hasher.update([0x05u8]);
+    hasher.update([iss_bytes.len() as u8]);
     hasher.update(iss_bytes);
     hasher.update(seed_bytes);
     hasher.finalize().digest
