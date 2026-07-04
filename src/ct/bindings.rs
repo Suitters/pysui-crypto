@@ -8,7 +8,7 @@ use fastcrypto::groups::ristretto255::{RistrettoPoint, RistrettoScalar};
 use fastcrypto::serde_helpers::ToFromByteArray;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::HashMap;
 use zeroize::Zeroizing;
 
@@ -196,6 +196,149 @@ fn unwrap_proof<'py>(
     Ok(PyBytes::new(py, &proof))
 }
 
+/// Construct a batched confidential transfer with encrypted amounts and zero-knowledge proofs.
+///
+/// Returns `{"encrypted_amounts": list[bytes], "new_balance_amount": bytes(256),
+/// "range_proofs": list[bytes], "consistency_proofs": list[bytes(512)],
+/// "sender_total_consistency_proof": bytes, "balance_proof": bytes(96),
+/// "total_sender_handle": bytes(32), "seed_point": bytes(32)}`.
+#[pyfunction]
+fn batched_transfer_proofs<'py>(
+    py: Python<'py>,
+    sender_private_key: &[u8],
+    sender_public_key: &[u8],
+    old_active_balance: &[u8],
+    recipients: Vec<(Vec<u8>, u64)>,
+    new_balance: u64,
+    session_id: &[u8],
+) -> PyResult<Bound<'py, PyDict>> {
+    let sk = private_key_from_bytes(sender_private_key)?;
+    let pk = point_from_bytes(sender_public_key, "sender_public_key")?;
+
+    let old_balance: [u8; 256] = old_active_balance
+        .try_into()
+        .map_err(|_| PyValueError::new_err("old_active_balance must be exactly 256 bytes"))?;
+
+    let session = session_id_from_bytes(session_id)?;
+
+    // Validate recipient count before parsing (1 <= N <= 255)
+    if !(1..=255).contains(&recipients.len()) {
+        return Err(PyValueError::new_err(format!(
+            "recipients length must be in [1, 255], got {}",
+            recipients.len()
+        )));
+    }
+
+    // Parse recipients: Vec<(Vec<u8>, u64)> -> Vec<(RistrettoPoint, u64)>
+    let parsed_recipients: Result<Vec<(RistrettoPoint, u64)>, PyErr> = recipients
+        .iter()
+        .enumerate()
+        .map(|(i, (pk_bytes, amount))| {
+            let recipient_pk = point_from_bytes(pk_bytes, &format!("recipients[{i}]"))?;
+            Ok((recipient_pk, *amount))
+        })
+        .collect();
+    let parsed_recipients = parsed_recipients?;
+
+    let result = proofs::batched_transfer_proofs(&sk, &pk, &old_balance, &parsed_recipients, new_balance, &session)
+        .map_err(ct_value_error)?;
+
+    let dict = PyDict::new(py);
+
+    // encrypted_amounts: Vec<[u8; 256]> -> list[bytes]
+    dict.set_item("encrypted_amounts", PyList::new(py, result.encrypted_amounts
+        .iter()
+        .map(|ba| PyBytes::new(py, ba))
+        .collect::<Vec<_>>())?)?;
+
+    // new_balance_amount: [u8; 256] -> bytes
+    dict.set_item("new_balance_amount", PyBytes::new(py, &result.new_balance_amount))?;
+
+    // range_proofs: Vec<Vec<u8>> -> list[bytes]
+    dict.set_item("range_proofs", PyList::new(py, result.range_proofs
+        .iter()
+        .map(|v| PyBytes::new(py, v))
+        .collect::<Vec<_>>())?)?;
+
+    // consistency_proofs: Vec<[u8; 512]> -> list[bytes]
+    dict.set_item("consistency_proofs", PyList::new(py, result.consistency_proofs
+        .iter()
+        .map(|ba| PyBytes::new(py, ba))
+        .collect::<Vec<_>>())?)?;
+
+    // sender_total_consistency_proof: Vec<u8> -> bytes
+    dict.set_item(
+        "sender_total_consistency_proof",
+        PyBytes::new(py, &result.sender_total_consistency_proof),
+    )?;
+
+    // balance_proof: Vec<u8> -> bytes
+    dict.set_item("balance_proof", PyBytes::new(py, &result.balance_proof))?;
+
+    // total_sender_handle: [u8; 32] -> bytes
+    dict.set_item("total_sender_handle", PyBytes::new(py, &result.total_sender_handle))?;
+
+    // seed_point: [u8; 32] -> bytes
+    dict.set_item("seed_point", PyBytes::new(py, &result.seed_point))?;
+
+    // sk (Zeroizing<RistrettoScalar>) is dropped here, zeroizing the scalar
+    Ok(dict)
+}
+
+/// Prove key rotation (rekeying) of a confidential-transfer amount.
+///
+/// Given old and new private/public keypairs and an encrypted amount (256 bytes),
+/// returns four rekeyed decryption handles (32 bytes each) and a batched DDH proof
+/// (192 bytes: 5 commitments + z scalar) proving that the same witness `w =
+/// new_sk / old_sk` was applied uniformly to all four limb handles.
+///
+/// Returns `{"new_handles": list[bytes] (4x32), "rekey_proof": bytes(192)}`.
+#[pyfunction]
+fn rekey_proofs<'py>(
+    py: Python<'py>,
+    old_private_key: &[u8],
+    old_public_key: &[u8],
+    new_private_key: &[u8],
+    new_public_key: &[u8],
+    active_balance: &[u8],
+    session_id: &[u8],
+) -> PyResult<Bound<'py, PyDict>> {
+    let old_sk = private_key_from_bytes(old_private_key)?;
+    let new_sk = private_key_from_bytes(new_private_key)?;
+    let old_pk = point_from_bytes(old_public_key, "old_public_key")?;
+    let new_pk = point_from_bytes(new_public_key, "new_public_key")?;
+
+    let balance: [u8; 256] = active_balance
+        .try_into()
+        .map_err(|_| PyValueError::new_err("active_balance must be exactly 256 bytes"))?;
+
+    let session = session_id_from_bytes(session_id)?;
+
+    let result = crate::ct::rekey::rekey_proofs(&old_sk, &old_pk, &new_sk, &new_pk, &balance, &session)
+        .map_err(ct_value_error)?;
+
+    let dict = PyDict::new(py);
+
+    // new_handles: Vec<[u8; 32]> -> list[bytes]
+    dict.set_item(
+        "new_handles",
+        PyList::new(
+            py,
+            result
+                .new_handles
+                .iter()
+                .map(|ba| PyBytes::new(py, ba))
+                .collect::<Vec<_>>(),
+        )?,
+    )?;
+
+    // rekey_proof: Vec<u8> -> bytes
+    dict.set_item("rekey_proof", PyBytes::new(py, &result.rekey_proof))?;
+
+    // Both old_sk and new_sk (Zeroizing<RistrettoScalar>) are dropped here, zeroizing both scalars
+    Ok(dict)
+}
+
 /// Register all confidential-transfer (CT) primitives on the extension module.
 pub fn register_ct(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBsgsTable>()?;
@@ -205,6 +348,8 @@ pub fn register_ct(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encrypt_amount_with_proofs, m)?)?;
     m.add_function(wrap_pyfunction!(register_with_auditors, m)?)?;
     m.add_function(wrap_pyfunction!(unwrap_proof, m)?)?;
+    m.add_function(wrap_pyfunction!(batched_transfer_proofs, m)?)?;
+    m.add_function(wrap_pyfunction!(rekey_proofs, m)?)?;
     Ok(())
 }
 

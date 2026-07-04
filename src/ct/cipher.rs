@@ -16,6 +16,7 @@ use crate::ct::generators::{g, h};
 use crate::ct::wire::{self, Reader};
 use fastcrypto::error::{FastCryptoError, FastCryptoResult};
 use fastcrypto::groups::ristretto255::{RistrettoPoint, RistrettoScalar};
+use fastcrypto::groups::GroupElement;
 use fastcrypto::serde_helpers::ToFromByteArray;
 use rand::{thread_rng, RngCore};
 use std::collections::HashMap;
@@ -86,11 +87,43 @@ impl Ciphertext {
     }
 }
 
+/// Collapse four 16-bit encrypted limbs into a single u64 Ciphertext.
+/// Each limb i (0..3) is weighted by 2^(16*i). Both commitment and
+/// decryption_handle are scaled by the same scalar weight.
+///
+/// collapsed.commitment = Σ (2^(16*i)) * limb[i].commitment
+/// collapsed.decryption_handle = Σ (2^(16*i)) * limb[i].decryption_handle
+pub fn collapse_encrypted(limbs: &[Ciphertext; wire::LIMB_COUNT]) -> Ciphertext {
+    // Build weights as scalar values: 1, 2^16, 2^32, 2^48.
+    let shift_weight = RistrettoScalar::from(1u64 << 16);
+
+    let mut weight = RistrettoScalar::from(1u64);
+    let mut collapsed_commitment = g() * RistrettoScalar::zero(); // neutral element via zero mult
+    let mut collapsed_handle = g() * RistrettoScalar::zero();
+
+    for limb in limbs {
+        collapsed_commitment += limb.commitment * weight;
+        collapsed_handle += limb.decryption_handle * weight;
+        weight *= shift_weight;
+    }
+
+    Ciphertext {
+        commitment: collapsed_commitment,
+        decryption_handle: collapsed_handle,
+    }
+}
+
+/// Rekey a decryption handle: multiply by a scalar. Computes `w * handle`.
+pub fn rekey_handle(w: &RistrettoScalar, handle: &RistrettoPoint) -> RistrettoPoint {
+    *handle * *w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ct::keys::{public_key, random_private_key};
     use crate::ct::table::precompute;
+    use fastcrypto::groups::Scalar;
 
     #[test]
     fn encrypt_decrypt_round_trips() {
@@ -112,5 +145,104 @@ mod tests {
         assert_eq!(bytes.len(), wire::CIPHERTEXT_LEN);
         let reparsed = Ciphertext::from_bytes(&bytes).expect("parse");
         assert_eq!(reparsed.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn collapse_encrypted_combines_limbs_correctly() {
+        // Pick a known u64 value and split into 4 u16 limbs.
+        let value: u64 = 0x1234_5678_9ABC_DEF0;
+        let limbs = [
+            (value & 0xFFFF) as u16,
+            ((value >> 16) & 0xFFFF) as u16,
+            ((value >> 32) & 0xFFFF) as u16,
+            ((value >> 48) & 0xFFFF) as u16,
+        ];
+
+        // Pick a deterministic keypair from known constants.
+        let sk = RistrettoScalar::from(98765u64);
+        let pk = g() * sk;
+
+        // Pick 4 deterministic blinding scalars.
+        let blindings = [
+            RistrettoScalar::from(1111u64),
+            RistrettoScalar::from(2222u64),
+            RistrettoScalar::from(3333u64),
+            RistrettoScalar::from(4444u64),
+        ];
+
+        // Build each limb ciphertext using the exact cipher construction.
+        let ciphertexts: [Ciphertext; 4] = std::array::from_fn(|i| {
+            let limb_scalar = RistrettoScalar::from(limbs[i] as u64);
+            Ciphertext {
+                commitment: h() * limb_scalar + g() * blindings[i],
+                decryption_handle: pk * blindings[i],
+            }
+        });
+
+        let collapsed = collapse_encrypted(&ciphertexts);
+
+        // Compute expected weighted blinding: b0*1 + b1*2^16 + b2*2^32 + b3*2^48.
+        let weights = [
+            RistrettoScalar::from(1u64),
+            RistrettoScalar::from(1u64 << 16),
+            RistrettoScalar::from(1u64 << 32),
+            RistrettoScalar::from(1u64 << 48),
+        ];
+        let mut expected_blind = RistrettoScalar::from(0u64);
+        for i in 0..4 {
+            expected_blind += blindings[i] * weights[i];
+        }
+
+        // Compute expected commitment and decryption_handle.
+        let expected_commitment = h() * RistrettoScalar::from(value) + g() * expected_blind;
+        let expected_handle = pk * expected_blind;
+
+        // Assert algebraic identity: collapsed = expected.
+        assert_eq!(
+            collapsed.commitment.to_byte_array(),
+            expected_commitment.to_byte_array(),
+            "collapsed commitment must equal h()*value + g()*expected_blind"
+        );
+        assert_eq!(
+            collapsed.decryption_handle.to_byte_array(),
+            expected_handle.to_byte_array(),
+            "collapsed decryption_handle must equal pk*expected_blind"
+        );
+    }
+
+    #[test]
+    fn rekey_handle_scales_correctly() {
+        // Pick two distinct nonzero private keys.
+        let old_sk = RistrettoScalar::from(11111u64);
+        let new_sk = RistrettoScalar::from(22222u64);
+
+        // Compute public keys.
+        let old_pk = g() * old_sk;
+        let new_pk = g() * new_sk;
+
+        // Pick a nonzero blinding scalar r.
+        let r = RistrettoScalar::from(33333u64);
+
+        // Create a decryption handle under the old key: d_old = old_pk * r.
+        let d_old = old_pk * r;
+
+        // Compute rekeying scalar: w = new_sk * old_sk.inverse().
+        // This should not fail since old_sk is nonzero.
+        let old_sk_inv = old_sk
+            .inverse()
+            .expect("old_sk is nonzero, so inverse must exist");
+        let w = new_sk * old_sk_inv;
+
+        // Rekey the handle.
+        let rekeyed = rekey_handle(&w, &d_old);
+
+        // Rekey property: w = new_sk * old_sk^-1 maps d_old = r*old_pk to r*new_pk,
+        // i.e. the handle a fresh encryption under new_pk with the same r would produce.
+        let expected = new_pk * r;
+        assert_eq!(
+            rekeyed.to_byte_array(),
+            expected.to_byte_array(),
+            "rekey_handle must map old_pk*r to new_pk*r (the rekeying property)"
+        );
     }
 }

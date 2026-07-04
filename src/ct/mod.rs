@@ -8,10 +8,13 @@
 //! confidential-transfers Move contracts and the reference TypeScript SDK.
 
 pub mod amount;
+pub mod batched_ddh;
 pub mod bindings;
 pub mod cipher;
 pub mod generators;
 pub mod keys;
 pub mod proofs;
+pub mod rekey;
 pub mod table;
+pub mod transfer_seed;
 pub mod wire;

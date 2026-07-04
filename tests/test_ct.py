@@ -165,3 +165,445 @@ class TestEncryptDecryptInterop:
             kp["private_key"], result["encrypted_amount"], bsgs_table
         )
         assert decrypted == amount
+
+
+class TestBatchedTransferProofs:
+    def test_returns_named_dict_with_all_keys(self) -> None:
+        """Test that batched_transfer_proofs returns a dict with all 8 required keys."""
+        sender = _keypair()
+        recipient1 = _keypair()
+        recipient2 = _keypair()
+
+        # Build old_active_balance by encrypting an initial amount
+        starting_balance = 1000
+        encrypted = pc.encrypt_amount_with_proofs(
+            sender["public_key"], starting_balance, SESSION_ID
+        )
+        old_active_balance = encrypted["encrypted_amount"]
+
+        # Define transfers
+        recipients = [
+            (recipient1["public_key"], 100),
+            (recipient2["public_key"], 200),
+        ]
+        new_balance = starting_balance - 300
+
+        result = pc.batched_transfer_proofs(
+            sender["private_key"],
+            sender["public_key"],
+            old_active_balance,
+            recipients,
+            new_balance,
+            SESSION_ID,
+        )
+
+        # Check all 8 keys are present
+        expected_keys = {
+            "encrypted_amounts",
+            "new_balance_amount",
+            "range_proofs",
+            "consistency_proofs",
+            "sender_total_consistency_proof",
+            "balance_proof",
+            "total_sender_handle",
+            "seed_point",
+        }
+        assert set(result.keys()) == expected_keys
+
+    def test_encrypted_amounts_length_and_format(self) -> None:
+        """Test encrypted_amounts: list of 256-byte items, one per recipient."""
+        sender = _keypair()
+        recipient = _keypair()
+
+        starting_balance = 1000
+        encrypted = pc.encrypt_amount_with_proofs(
+            sender["public_key"], starting_balance, SESSION_ID
+        )
+        old_active_balance = encrypted["encrypted_amount"]
+
+        recipients = [(recipient["public_key"], 100)]
+        new_balance = 900
+
+        result = pc.batched_transfer_proofs(
+            sender["private_key"],
+            sender["public_key"],
+            old_active_balance,
+            recipients,
+            new_balance,
+            SESSION_ID,
+        )
+
+        encrypted_amounts = result["encrypted_amounts"]
+        assert len(encrypted_amounts) == 1
+        assert isinstance(encrypted_amounts[0], bytes)
+        assert len(encrypted_amounts[0]) == 256
+
+    def test_two_recipients_component_lengths(self) -> None:
+        """Test with N=2 recipients: batch_sizes(3)=[2,1] -> 2 range proofs, 3 consistency proofs."""
+        sender = _keypair()
+        recipient1 = _keypair()
+        recipient2 = _keypair()
+
+        starting_balance = 1000
+        encrypted = pc.encrypt_amount_with_proofs(
+            sender["public_key"], starting_balance, SESSION_ID
+        )
+        old_active_balance = encrypted["encrypted_amount"]
+
+        recipients = [
+            (recipient1["public_key"], 100),
+            (recipient2["public_key"], 200),
+        ]
+        new_balance = 700
+
+        result = pc.batched_transfer_proofs(
+            sender["private_key"],
+            sender["public_key"],
+            old_active_balance,
+            recipients,
+            new_balance,
+            SESSION_ID,
+        )
+
+        # N=2 recipients + 1 new_balance = 3 total amounts
+        # batch_sizes(3) = [2, 1]
+        assert len(result["encrypted_amounts"]) == 2
+        assert all(len(ea) == 256 for ea in result["encrypted_amounts"])
+
+        assert len(result["new_balance_amount"]) == 256
+
+        assert len(result["range_proofs"]) == 2
+        assert all(isinstance(rp, bytes) for rp in result["range_proofs"])
+
+        # consistency_proofs: N recipients + 1 new_balance = 3
+        assert len(result["consistency_proofs"]) == 3
+        assert all(len(cp) == 512 for cp in result["consistency_proofs"])
+
+        assert isinstance(result["sender_total_consistency_proof"], bytes)
+        assert isinstance(result["balance_proof"], bytes)
+        assert len(result["balance_proof"]) == 96
+
+        assert len(result["total_sender_handle"]) == 32
+        assert len(result["seed_point"]) == 32
+
+    def test_one_recipient_component_lengths(self) -> None:
+        """Test with N=1 recipient: batch_sizes(2)=[2] -> 1 range proof, 2 consistency proofs."""
+        sender = _keypair()
+        recipient = _keypair()
+
+        starting_balance = 1000
+        encrypted = pc.encrypt_amount_with_proofs(
+            sender["public_key"], starting_balance, SESSION_ID
+        )
+        old_active_balance = encrypted["encrypted_amount"]
+
+        recipients = [(recipient["public_key"], 100)]
+        new_balance = 900
+
+        result = pc.batched_transfer_proofs(
+            sender["private_key"],
+            sender["public_key"],
+            old_active_balance,
+            recipients,
+            new_balance,
+            SESSION_ID,
+        )
+
+        # N=1 recipient + 1 new_balance = 2 total amounts
+        # batch_sizes(2) = [2]
+        assert len(result["encrypted_amounts"]) == 1
+        assert len(result["new_balance_amount"]) == 256
+
+        assert len(result["range_proofs"]) == 1
+        assert len(result["consistency_proofs"]) == 2
+        assert all(len(cp) == 512 for cp in result["consistency_proofs"])
+
+        assert len(result["balance_proof"]) == 96
+        assert len(result["total_sender_handle"]) == 32
+        assert len(result["seed_point"]) == 32
+
+    def test_bad_private_key_length_raises(self) -> None:
+        """Test that invalid sender_private_key length raises ValueError."""
+        pk = _keypair()["public_key"]
+        encrypted = pc.encrypt_amount_with_proofs(pk, 1000, SESSION_ID)
+        with pytest.raises(ValueError):
+            pc.batched_transfer_proofs(
+                bytes(31),  # Bad length
+                pk,
+                encrypted["encrypted_amount"],
+                [(pk, 100)],
+                900,
+                SESSION_ID,
+            )
+
+    def test_bad_public_key_length_raises(self) -> None:
+        """Test that invalid sender_public_key length raises ValueError."""
+        sk = _keypair()["private_key"]
+        pk = _keypair()["public_key"]
+        encrypted = pc.encrypt_amount_with_proofs(pk, 1000, SESSION_ID)
+        with pytest.raises(ValueError):
+            pc.batched_transfer_proofs(
+                sk,
+                bytes(31),  # Bad length
+                encrypted["encrypted_amount"],
+                [(pk, 100)],
+                900,
+                SESSION_ID,
+            )
+
+    def test_bad_old_balance_length_raises(self) -> None:
+        """Test that invalid old_active_balance length raises ValueError."""
+        sender = _keypair()
+        pk = _keypair()["public_key"]
+        with pytest.raises(ValueError):
+            pc.batched_transfer_proofs(
+                sender["private_key"],
+                sender["public_key"],
+                bytes(255),  # Bad length
+                [(pk, 100)],
+                900,
+                SESSION_ID,
+            )
+
+    def test_bad_session_id_length_raises(self) -> None:
+        """Test that invalid session_id length raises ValueError."""
+        sender = _keypair()
+        encrypted = pc.encrypt_amount_with_proofs(
+            sender["public_key"], 1000, SESSION_ID
+        )
+        pk = _keypair()["public_key"]
+        with pytest.raises(ValueError):
+            pc.batched_transfer_proofs(
+                sender["private_key"],
+                sender["public_key"],
+                encrypted["encrypted_amount"],
+                [(pk, 100)],
+                900,
+                bytes(19),  # Bad length
+            )
+
+
+class TestRekeyProofs:
+    """Test key rotation proofs for confidential-transfer amounts."""
+
+    def test_returns_named_dict_with_required_keys(self) -> None:
+        """Test that rekey_proofs returns a dict with keys 'new_handles' and 'rekey_proof'."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        # Build active_balance under old public key
+        original_value = 123456
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], original_value, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        result = pc.rekey_proofs(
+            old_kp["private_key"],
+            old_kp["public_key"],
+            new_kp["private_key"],
+            new_kp["public_key"],
+            active_balance,
+            SESSION_ID,
+        )
+
+        assert isinstance(result, dict)
+        assert set(result.keys()) == {"new_handles", "rekey_proof"}
+
+    def test_new_handles_format(self) -> None:
+        """Test that new_handles is a list of 4 items, each 32 bytes."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], 456789, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        result = pc.rekey_proofs(
+            old_kp["private_key"],
+            old_kp["public_key"],
+            new_kp["private_key"],
+            new_kp["public_key"],
+            active_balance,
+            SESSION_ID,
+        )
+
+        new_handles = result["new_handles"]
+        assert isinstance(new_handles, list)
+        assert len(new_handles) == 4
+        assert all(isinstance(h, bytes) for h in new_handles)
+        assert all(len(h) == 32 for h in new_handles)
+
+    def test_rekey_proof_format(self) -> None:
+        """Test that rekey_proof is 192 bytes (5 commitments + z scalar)."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], 999999, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        result = pc.rekey_proofs(
+            old_kp["private_key"],
+            old_kp["public_key"],
+            new_kp["private_key"],
+            new_kp["public_key"],
+            active_balance,
+            SESSION_ID,
+        )
+
+        rekey_proof = result["rekey_proof"]
+        assert isinstance(rekey_proof, bytes)
+        assert len(rekey_proof) == 192
+
+    def test_new_handles_differ_from_old_handles(self) -> None:
+        """Test that new_handles differ from old handles (rotation actually changed them)."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        original_value = 500000
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], original_value, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        # Extract old handles from active_balance (4 x 64-byte ciphertexts; handle is bytes 32-64 of each)
+        old_handles = []
+        for i in range(4):
+            offset = i * 64 + 32  # Skip commitment (32), get handle (32)
+            old_handle = active_balance[offset : offset + 32]
+            old_handles.append(old_handle)
+
+        result = pc.rekey_proofs(
+            old_kp["private_key"],
+            old_kp["public_key"],
+            new_kp["private_key"],
+            new_kp["public_key"],
+            active_balance,
+            SESSION_ID,
+        )
+
+        new_handles = result["new_handles"]
+
+        # Verify each new handle differs from its corresponding old handle
+        for i, (old_h, new_h) in enumerate(zip(old_handles, new_handles)):
+            assert (
+                old_h != new_h
+            ), f"new_handles[{i}] should differ from old_handles[{i}]"
+
+    def test_bad_old_private_key_length_raises(self) -> None:
+        """Test that invalid old_private_key length raises ValueError."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], 1000, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        with pytest.raises(ValueError):
+            pc.rekey_proofs(
+                bytes(31),  # Bad length
+                old_kp["public_key"],
+                new_kp["private_key"],
+                new_kp["public_key"],
+                active_balance,
+                SESSION_ID,
+            )
+
+    def test_bad_old_public_key_length_raises(self) -> None:
+        """Test that invalid old_public_key length raises ValueError."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], 1000, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        with pytest.raises(ValueError):
+            pc.rekey_proofs(
+                old_kp["private_key"],
+                bytes(31),  # Bad length
+                new_kp["private_key"],
+                new_kp["public_key"],
+                active_balance,
+                SESSION_ID,
+            )
+
+    def test_bad_new_private_key_length_raises(self) -> None:
+        """Test that invalid new_private_key length raises ValueError."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], 1000, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        with pytest.raises(ValueError):
+            pc.rekey_proofs(
+                old_kp["private_key"],
+                old_kp["public_key"],
+                bytes(31),  # Bad length
+                new_kp["public_key"],
+                active_balance,
+                SESSION_ID,
+            )
+
+    def test_bad_new_public_key_length_raises(self) -> None:
+        """Test that invalid new_public_key length raises ValueError."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], 1000, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        with pytest.raises(ValueError):
+            pc.rekey_proofs(
+                old_kp["private_key"],
+                old_kp["public_key"],
+                new_kp["private_key"],
+                bytes(31),  # Bad length
+                active_balance,
+                SESSION_ID,
+            )
+
+    def test_bad_active_balance_length_raises(self) -> None:
+        """Test that invalid active_balance length raises ValueError."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        with pytest.raises(ValueError):
+            pc.rekey_proofs(
+                old_kp["private_key"],
+                old_kp["public_key"],
+                new_kp["private_key"],
+                new_kp["public_key"],
+                bytes(255),  # Bad length
+                SESSION_ID,
+            )
+
+    def test_bad_session_id_length_raises(self) -> None:
+        """Test that invalid session_id length raises ValueError."""
+        old_kp = _keypair()
+        new_kp = _keypair()
+
+        encrypted = pc.encrypt_amount_with_proofs(
+            old_kp["public_key"], 1000, SESSION_ID
+        )
+        active_balance = encrypted["encrypted_amount"]
+
+        with pytest.raises(ValueError):
+            pc.rekey_proofs(
+                old_kp["private_key"],
+                old_kp["public_key"],
+                new_kp["private_key"],
+                new_kp["public_key"],
+                active_balance,
+                bytes(19),  # Bad length
+            )

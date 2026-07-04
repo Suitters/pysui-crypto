@@ -97,3 +97,21 @@ def unwrap_proof(
     decryption_handle: bytes,
     session_id: bytes,
 ) -> bytes: ...
+
+def batched_transfer_proofs(
+    sender_private_key: bytes,
+    sender_public_key: bytes,
+    old_active_balance: bytes,
+    recipients: list[tuple[bytes, int]],
+    new_balance: int,
+    session_id: bytes,
+) -> dict[str, bytes | list[bytes]]: ...
+
+def rekey_proofs(
+    old_private_key: bytes,
+    old_public_key: bytes,
+    new_private_key: bytes,
+    new_public_key: bytes,
+    active_balance: bytes,
+    session_id: bytes,
+) -> dict[str, bytes | list[bytes]]: ...
