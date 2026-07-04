@@ -18,7 +18,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 /// Transfer-seed container for computing per-batch, per-limb blindings.
-#[derive(Clone, zeroize::ZeroizeOnDrop)]
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct TransferRandomness {
     seed: [u8; 32],
 }
@@ -64,7 +64,7 @@ pub fn sample_transfer_randomness(
     (seed_point, TransferRandomness { seed })
 }
 
-/// Recover transfer randomness from the recipient's secret key and seed_point.
+/// Recover transfer randomness from the sender's secret key and seed_point.
 ///
 /// Performs ECDH to compute the same shared secret as `sample_transfer_randomness`,
 /// then derives the seed.

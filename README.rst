@@ -1,9 +1,9 @@
 pysui-crypto
 ============
 
-A Python extension providing `zkLogin <https://docs.sui.io/concepts/cryptography/zklogin>`_ and
-`SEAL <https://github.com/MystenLabs/seal>`_ threshold encryption support for `Sui <https://sui.io>`_,
-extending the `pysui <https://github.com/FrankC01/pysui>`_ SDK.
+A Python extension providing `Sui <https://sui.io>`_ `zkLogin <https://docs.sui.io/concepts/cryptography/zklogin>`_,
+`SEAL <https://github.com/MystenLabs/seal>`_ and Confidential Transaction crypto primitives used by
+`pysui <https://github.com/FrankC01/pysui>`_.
 
 The library is backed by a Rust crate compiled via `PyO3 <https://pyo3.rs>`_ and
 `maturin <https://www.maturin.rs>`_, exposing a native Python extension module.
@@ -12,7 +12,7 @@ Requirements
 ------------
 
 * Python 3.10 or later
-* `pysui <https://github.com/FrankC01/pysui>`_ — integrated in the upcoming pysui 1.1.0 release (date TBD)
+* `pysui <https://github.com/FrankC01/pysui>`_ — see the pysui GitHub repository for integration availability
 
 Installation
 ------------

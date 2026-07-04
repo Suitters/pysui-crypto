@@ -77,6 +77,19 @@ def decrypt_balance(
     private_key: bytes, encrypted_amount: bytes, table: BsgsTable
 ) -> int: ...
 
+class TransferRandomness:
+    """Opaque handle returned by ``recover_transfer_randomness`` and passed to
+    ``decrypt_transfer_amount``. No public constructor or attributes."""
+    ...
+
+def recover_transfer_randomness(
+    private_key: bytes, seed_point: bytes
+) -> TransferRandomness: ...
+
+def decrypt_transfer_amount(
+    randomness: TransferRandomness, batch_index: int, encrypted_amount: bytes
+) -> int: ...
+
 def subtract_encrypted(balance: bytes, amount: bytes) -> bytes: ...
 
 def encrypt_amount_with_proofs(

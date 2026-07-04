@@ -607,3 +607,67 @@ class TestRekeyProofs:
                 active_balance,
                 bytes(19),  # Bad length
             )
+
+
+class TestSenderTransferRecovery:
+    """Sender-side recovery of previously-sent confidential transfer amounts."""
+
+    def _setup_transfer(self):
+        sender = _keypair()
+        r1 = _keypair()
+        r2 = _keypair()
+        starting_balance = 1000
+        encrypted = pc.encrypt_amount_with_proofs(
+            sender["public_key"], starting_balance, SESSION_ID
+        )
+        old_active_balance = encrypted["encrypted_amount"]
+        amounts = [100, 200]
+        recipients = [
+            (r1["public_key"], amounts[0]),
+            (r2["public_key"], amounts[1]),
+        ]
+        new_balance = starting_balance - sum(amounts)
+        result = pc.batched_transfer_proofs(
+            sender["private_key"],
+            sender["public_key"],
+            old_active_balance,
+            recipients,
+            new_balance,
+            SESSION_ID,
+        )
+        return sender, amounts, result
+
+    def test_recovers_each_sent_amount(self) -> None:
+        sender, amounts, result = self._setup_transfer()
+        tr = pc.recover_transfer_randomness(
+            sender["private_key"], result["seed_point"]
+        )
+        for i, amt in enumerate(amounts):
+            got = pc.decrypt_transfer_amount(tr, i, result["encrypted_amounts"][i])
+            assert got == amt
+
+    def test_wrong_private_key_fails(self) -> None:
+        _sender, _amounts, result = self._setup_transfer()
+        wrong = _keypair()
+        tr = pc.recover_transfer_randomness(
+            wrong["private_key"], result["seed_point"]
+        )
+        with pytest.raises(ValueError):
+            pc.decrypt_transfer_amount(tr, 0, result["encrypted_amounts"][0])
+
+    def test_wrong_batch_index_fails(self) -> None:
+        sender, _amounts, result = self._setup_transfer()
+        tr = pc.recover_transfer_randomness(
+            sender["private_key"], result["seed_point"]
+        )
+        with pytest.raises(ValueError):
+            # Only 2 recipients (indices 0,1); index 5 has no valid solution.
+            pc.decrypt_transfer_amount(tr, 5, result["encrypted_amounts"][0])
+
+    def test_bad_length_encrypted_amount_fails(self) -> None:
+        sender, _amounts, result = self._setup_transfer()
+        tr = pc.recover_transfer_randomness(
+            sender["private_key"], result["seed_point"]
+        )
+        with pytest.raises(ValueError):
+            pc.decrypt_transfer_amount(tr, 0, b"\x00" * 100)

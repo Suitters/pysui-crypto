@@ -51,6 +51,11 @@ impl Ciphertext {
     }
 
     /// Recover the u32 message using a precomputed BSGS `table`.
+    ///
+    /// This is the recipient/owner path: it has the secret key (not the
+    /// blinding) and strips the mask via `commitment - handle/sk`. For the
+    /// sender-side counterpart used when the blinding is known instead of the
+    /// secret key, see [`decrypt_with_blinding`].
     pub fn decrypt(
         &self,
         private_key: &RistrettoScalar,
@@ -85,6 +90,29 @@ impl Ciphertext {
             decryption_handle,
         })
     }
+}
+
+/// Recover the u16 limb value committed in `commitment`, given the `blinding`
+/// used to create it. Since `commitment = m*H + blinding*G`, we have
+/// `commitment - blinding*G = m*H`; a table-free 16-bit baby-step search then
+/// recovers `m` in `[0, 2^16)`. This is the sender-side recovery path — the
+/// blinding is re-derived from the transfer seed, so no decryption handle or
+/// secret key is needed. Sender-side counterpart of [`Ciphertext::decrypt`],
+/// which instead uses the secret key and a BSGS table. Returns `InvalidInput`
+/// if no valid `m` exists.
+pub(crate) fn decrypt_with_blinding(
+    commitment: &RistrettoPoint,
+    blinding: &RistrettoScalar,
+) -> FastCryptoResult<u16> {
+    let mut c = *commitment - g() * *blinding;
+    let identity = RistrettoPoint::zero();
+    for m in 0u32..(1u32 << 16) {
+        if c == identity {
+            return Ok(m as u16);
+        }
+        c -= h();
+    }
+    Err(FastCryptoError::InvalidInput)
 }
 
 /// Collapse four 16-bit encrypted limbs into a single u64 Ciphertext.
@@ -124,6 +152,25 @@ mod tests {
     use crate::ct::keys::{public_key, random_private_key};
     use crate::ct::table::precompute;
     use fastcrypto::groups::Scalar;
+
+    #[test]
+    fn decrypt_with_blinding_recovers_limb() {
+        use crate::ct::generators::{g, h};
+        use crate::ct::keys::random_private_key;
+        use fastcrypto::groups::ristretto255::RistrettoScalar;
+        for m in [0u16, 1, 0x1234, 0xffff] {
+            let blinding = random_private_key();
+            let commitment = h() * RistrettoScalar::from(m as u64) + g() * blinding;
+            let recovered =
+                super::decrypt_with_blinding(&commitment, &blinding).expect("recovers limb");
+            assert_eq!(recovered, m);
+        }
+        // A wrong blinding yields no solution.
+        let blinding = random_private_key();
+        let wrong = random_private_key();
+        let commitment = h() * RistrettoScalar::from(5u64) + g() * blinding;
+        assert!(super::decrypt_with_blinding(&commitment, &wrong).is_err());
+    }
 
     #[test]
     fn encrypt_decrypt_round_trips() {

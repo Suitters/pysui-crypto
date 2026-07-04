@@ -14,7 +14,8 @@
 //! range proofs (a later build step) enforce.
 #![allow(dead_code)]
 
-use crate::ct::cipher::Ciphertext;
+use crate::ct::cipher::{self, Ciphertext};
+use crate::ct::transfer_seed::TransferRandomness;
 use crate::ct::wire::{self, Reader};
 use fastcrypto::error::{FastCryptoError, FastCryptoResult};
 use fastcrypto::groups::ristretto255::{RistrettoPoint, RistrettoScalar};
@@ -97,6 +98,26 @@ impl EncryptedAmount {
             limbs.try_into().map_err(|_| FastCryptoError::InvalidInput)?;
         Ok(Self { limbs })
     }
+
+    /// Sender-side recovery of the plaintext u64 amount for the recipient at
+    /// `batch_index`, using transfer randomness recovered from the sender's
+    /// private key and the transfer `seed_point`. Loops the 4 limbs, re-derives
+    /// each limb blinding, solves each commitment for its u16 value, and
+    /// reassembles them little-endian. Returns `InvalidInput` if any limb has no
+    /// valid value (wrong randomness/batch_index or a mismatched amount).
+    pub(crate) fn decrypt_with_randomness(
+        &self,
+        randomness: &TransferRandomness,
+        batch_index: u8,
+    ) -> FastCryptoResult<u64> {
+        let mut amount: u64 = 0;
+        for l in 0..wire::LIMB_COUNT {
+            let blinding = randomness.blinding(batch_index, l as u8);
+            let value = cipher::decrypt_with_blinding(&self.limbs[l].commitment, &blinding)?;
+            amount |= (value as u64) << (16 * l);
+        }
+        Ok(amount)
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +125,34 @@ mod tests {
     use super::*;
     use crate::ct::keys::{public_key, random_private_key};
     use crate::ct::table::precompute;
+
+    #[test]
+    fn decrypt_with_randomness_round_trip() {
+        use crate::ct::cipher::Ciphertext;
+        use crate::ct::keys::{public_key, random_private_key};
+        use crate::ct::transfer_seed::{recover_transfer_randomness, sample_transfer_randomness};
+        use crate::ct::wire;
+        use super::EncryptedAmount;
+        let sk = random_private_key();
+        let pk = public_key(&sk);
+        let (seed_point, randomness) = sample_transfer_randomness(&pk);
+        let recovered = recover_transfer_randomness(&sk, &seed_point);
+        for amount in [0u64, 1, 300, 0xffff_ffff, u64::MAX] {
+            for batch_index in [0u8, 3, 42] {
+                let mut bytes = Vec::new();
+                for l in 0..wire::LIMB_COUNT {
+                    let v = ((amount >> (16 * l)) & 0xffff) as u32;
+                    let b = randomness.blinding(batch_index, l as u8);
+                    bytes.extend_from_slice(
+                        &Ciphertext::encrypt_with_blinding(&pk, v, &b).to_bytes(),
+                    );
+                }
+                let enc = EncryptedAmount::from_bytes(&bytes).unwrap();
+                let got = enc.decrypt_with_randomness(&recovered, batch_index).unwrap();
+                assert_eq!(got, amount, "amount={amount} batch_index={batch_index}");
+            }
+        }
+    }
 
     #[test]
     fn amount_round_trips() {

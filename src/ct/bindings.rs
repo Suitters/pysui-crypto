@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::ct::amount::EncryptedAmount;
-use crate::ct::{keys, proofs, table, wire};
+use crate::ct::{keys, proofs, table, transfer_seed, wire};
 use fastcrypto::error::FastCryptoError;
 use fastcrypto::groups::ristretto255::{RistrettoPoint, RistrettoScalar};
 use fastcrypto::serde_helpers::ToFromByteArray;
@@ -340,8 +340,61 @@ fn rekey_proofs<'py>(
 }
 
 /// Register all confidential-transfer (CT) primitives on the extension module.
+/// Opaque handle carrying recovered transfer randomness for one batched
+/// transfer. Produced by `recover_transfer_randomness`, consumed by
+/// `decrypt_transfer_amount`. Wraps the sender-derived seed (zeroized on drop);
+/// exposes no constructor or accessors to Python.
+#[pyclass(name = "TransferRandomness")]
+pub struct PyTransferRandomness {
+    pub(crate) inner: transfer_seed::TransferRandomness,
+}
+
+/// Recover transfer randomness from the sender's private key and the transfer
+/// `seed_point`. Sender-only (performs the `seed_point * private_key` ECDH). The
+/// returned handle is passed to `decrypt_transfer_amount`. Let it go out of
+/// scope after use so the seed is zeroized promptly.
+#[pyfunction]
+fn recover_transfer_randomness(
+    private_key: &[u8],
+    seed_point: &[u8],
+) -> PyResult<PyTransferRandomness> {
+    let sk = private_key_from_bytes(private_key)?;
+    let sp = point_from_bytes(seed_point, "seed_point")?;
+    Ok(PyTransferRandomness {
+        inner: transfer_seed::recover_transfer_randomness(&sk, &sp),
+    })
+}
+
+/// Recover the plaintext amount sent to the recipient at `batch_index` (0-based
+/// submission order) from that recipient's 256-byte on-chain `encrypted_amount`.
+/// Returns the plaintext u64. Raises if no valid amount is found (wrong private
+/// key, wrong batch_index, or a mismatched encrypted_amount).
+#[pyfunction]
+fn decrypt_transfer_amount(
+    randomness: &PyTransferRandomness,
+    batch_index: u8,
+    encrypted_amount: &[u8],
+) -> PyResult<u64> {
+    if encrypted_amount.len() != 256 {
+        return Err(PyValueError::new_err(
+            "encrypted_amount must be exactly 256 bytes",
+        ));
+    }
+    let amount = EncryptedAmount::from_bytes(encrypted_amount).map_err(ct_value_error)?;
+    amount
+        .decrypt_with_randomness(&randomness.inner, batch_index)
+        .map_err(|_| {
+            PyValueError::new_err(format!(
+                "transfer amount recovery failed for batch_index {batch_index}: \
+                 no valid amount found — verify private_key, batch_index, and that \
+                 encrypted_amount belongs to this transfer's seed_point"
+            ))
+        })
+}
+
 pub fn register_ct(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBsgsTable>()?;
+    m.add_class::<PyTransferRandomness>()?;
     m.add_function(wrap_pyfunction!(generate_twisted_elgamal_keypair, m)?)?;
     m.add_function(wrap_pyfunction!(decrypt_balance, m)?)?;
     m.add_function(wrap_pyfunction!(subtract_encrypted, m)?)?;
@@ -350,6 +403,8 @@ pub fn register_ct(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(unwrap_proof, m)?)?;
     m.add_function(wrap_pyfunction!(batched_transfer_proofs, m)?)?;
     m.add_function(wrap_pyfunction!(rekey_proofs, m)?)?;
+    m.add_function(wrap_pyfunction!(recover_transfer_randomness, m)?)?;
+    m.add_function(wrap_pyfunction!(decrypt_transfer_amount, m)?)?;
     Ok(())
 }
 
@@ -400,5 +455,39 @@ mod tests {
         proof
             .verify(&g(), &commitment, &pk, &decryption_handle, &dst)
             .expect("binding-layer DDH proof verifies");
+    }
+
+    #[test]
+    fn transfer_amount_recovery_binding_round_trip() {
+        use crate::ct::cipher::Ciphertext;
+        use crate::ct::keys::{public_key, random_private_key};
+        use crate::ct::transfer_seed::sample_transfer_randomness;
+        use crate::ct::wire;
+        use fastcrypto::serde_helpers::ToFromByteArray;
+
+        let sk = random_private_key();
+        let pk = public_key(&sk);
+        let (seed_point, randomness) = sample_transfer_randomness(&pk);
+        let amount = 12_345u64;
+        let batch_index = 2u8;
+
+        let mut enc = Vec::new();
+        for l in 0..wire::LIMB_COUNT {
+            let v = ((amount >> (16 * l)) & 0xffff) as u32;
+            let b = randomness.blinding(batch_index, l as u8);
+            enc.extend_from_slice(&Ciphertext::encrypt_with_blinding(&pk, v, &b).to_bytes());
+        }
+
+        let handle =
+            recover_transfer_randomness(&sk.to_byte_array(), &seed_point.to_byte_array())
+                .expect("recover_transfer_randomness binding succeeds");
+        let got = decrypt_transfer_amount(&handle, batch_index, &enc)
+            .expect("decrypt_transfer_amount binding succeeds");
+        assert_eq!(got, amount);
+
+        // Wrong batch_index -> no solution.
+        assert!(decrypt_transfer_amount(&handle, batch_index + 1, &enc).is_err());
+        // Wrong length -> error.
+        assert!(decrypt_transfer_amount(&handle, batch_index, &enc[..255]).is_err());
     }
 }
