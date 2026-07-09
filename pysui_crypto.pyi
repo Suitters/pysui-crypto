@@ -111,6 +111,15 @@ def unwrap_proof(
     session_id: bytes,
 ) -> bytes: ...
 
+def unwrap_proofs(
+    sender_private_key: bytes,
+    sender_public_key: bytes,
+    old_active_balance: bytes,
+    amount: int,
+    new_balance: int,
+    session_id: bytes,
+) -> dict[str, bytes | list[bytes]]: ...
+
 def batched_transfer_proofs(
     sender_private_key: bytes,
     sender_public_key: bytes,

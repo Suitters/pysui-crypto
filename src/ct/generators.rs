@@ -36,4 +36,15 @@ mod tests {
         assert_eq!(h().to_byte_array(), h().to_byte_array());
         assert_ne!(h().to_byte_array(), g().to_byte_array());
     }
+
+    /// `H` must equal the constant hardcoded in the on-chain Move verifier
+    /// (`twisted_elgamal::h()` in the confidential-transfers package). Any drift
+    /// here silently invalidates every commitment we emit.
+    #[test]
+    fn h_matches_move_constant() {
+        assert_eq!(
+            hex::encode(h().to_byte_array()),
+            "34ce1477c14558178089500a39c864e0f607b3c1f41ab398400e4a9de6d2c446"
+        );
+    }
 }

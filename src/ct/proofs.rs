@@ -542,6 +542,104 @@ pub fn unwrap_proof(
     prove_encrypts_zero(sender_private_key, sender_public_key, commitment, decryption_handle, &dst_ddh)
 }
 
+/// Raw byte components of a confidential unwrap (withdraw to a public amount):
+/// the sender's freshly-encrypted new balance with its well-formedness proofs,
+/// plus the DDH balance proof tying `new_balance = old_balance - amount`.
+///
+/// `range_proofs` and `consistency_proofs` always hold exactly one element. They
+/// are vectors so the Python surface mirrors [`BatchedTransferProofs`].
+pub struct UnwrapProofs {
+    pub new_balance_amount: [u8; 256],
+    pub range_proofs: Vec<Vec<u8>>,
+    pub consistency_proofs: Vec<[u8; 512]>,
+    pub balance_proof: Vec<u8>,
+}
+
+/// Construct the full proof set for a confidential unwrap of a PUBLIC `amount`.
+///
+/// Freshly encrypts `new_balance` under the sender's own key (per-limb consistency
+/// proofs, DST `session_id ‖ 0x02`; aggregated 16-bit range proof, DST
+/// `session_id ‖ 0x04`), then proves the residual encrypts zero (DST
+/// `session_id ‖ 0x01`).
+///
+/// # Residual derivation
+/// The on-chain verifier (`balance::try_split_to_public`) computes
+/// `expected = old.collapse()` then `expected.sub_assign_u64(amount)`, which
+/// subtracts `amount*H` from the *commitment* and leaves the decryption handle
+/// untouched. `encrypted_amount::verify_equal` then DDH-verifies
+/// `new.collapse() - expected`. So the residual is:
+///
+/// ```text
+/// commitment = nb.commitment - old.commitment + amount*H
+/// handle     = nb.handle     - old.handle
+/// ```
+///
+/// Note the public term is `amount*H` (the *value* generator), not `amount*G`, and
+/// contributes the identity to the handle. When `new_balance = old_balance - amount`
+/// the value terms cancel, leaving the zero-encryption
+/// `((r_nb - r_old)*G, (r_nb - r_old)*pk)`, for which `sk` is a valid DDH witness.
+///
+/// # Purity
+/// This is a pure prover: it performs no overspend check and never decrypts
+/// `old_active_balance`. The caller must supply
+/// `new_balance = decrypt(old_active_balance) - amount` and reject overspend
+/// client-side, exactly as [`batched_transfer_proofs`] already requires.
+///
+/// # Arguments
+/// * `sender_private_key` — sender's private key
+/// * `sender_public_key` — sender's public key
+/// * `old_active_balance` — sender's current active ciphertext (256 bytes, 4 limbs)
+/// * `amount` — the public plaintext amount being unwrapped
+/// * `new_balance` — sender's plaintext balance after the unwrap
+/// * `session_id` — 20-byte session identifier
+#[allow(dead_code)]
+pub fn unwrap_proofs(
+    sender_private_key: &RistrettoScalar,
+    sender_public_key: &RistrettoPoint,
+    old_active_balance: &[u8; 256],
+    amount: u64,
+    new_balance: u64,
+    session_id: &[u8; 20],
+) -> FastCryptoResult<UnwrapProofs> {
+    // Fresh encryption of the new balance under the sender's own key.
+    let enc = encrypt_amount_with_proofs(sender_public_key, new_balance, session_id)?;
+
+    let mut new_balance_amount = [0u8; 256];
+    new_balance_amount.copy_from_slice(&enc.encrypted_amount);
+    let mut consistency_proof = [0u8; 512];
+    consistency_proof.copy_from_slice(&enc.consistency_proof);
+
+    // Collapse both balances' four 16-bit limbs into a single ciphertext each.
+    let parse_limbs = |bytes: &[u8]| -> FastCryptoResult<[cipher::Ciphertext; 4]> {
+        let limbs: Vec<cipher::Ciphertext> = (0..4)
+            .map(|l| cipher::Ciphertext::from_bytes(&bytes[l * 64..(l + 1) * 64]))
+            .collect::<FastCryptoResult<_>>()?;
+        limbs.try_into().map_err(|_| FastCryptoError::InvalidInput)
+    };
+    let old_collapsed = cipher::collapse_encrypted(&parse_limbs(old_active_balance)?);
+    let nb_collapsed = cipher::collapse_encrypted(&parse_limbs(&new_balance_amount)?);
+
+    // Residual: new_balance - old_balance + amount*H (handle gets the identity).
+    let residual_commitment =
+        nb_collapsed.commitment - old_collapsed.commitment + h() * RistrettoScalar::from(amount);
+    let residual_handle = nb_collapsed.decryption_handle - old_collapsed.decryption_handle;
+
+    let balance_proof = unwrap_proof(
+        sender_private_key,
+        sender_public_key,
+        &residual_commitment,
+        &residual_handle,
+        session_id,
+    );
+
+    Ok(UnwrapProofs {
+        new_balance_amount,
+        range_proofs: vec![enc.range_proof],
+        consistency_proofs: vec![consistency_proof],
+        balance_proof,
+    })
+}
+
 /// Raw byte components of a batched confidential transfer: encrypted receiver amounts,
 /// new balance, range proofs for all limbs, per-limb consistency proofs,
 /// sender total consistency proof, balance proof, and seed material.

@@ -196,6 +196,80 @@ fn unwrap_proof<'py>(
     Ok(PyBytes::new(py, &proof))
 }
 
+/// Construct the full proof set for a confidential unwrap of a public `amount`.
+///
+/// Freshly encrypts `new_balance` under the sender's key and proves the residual
+/// `new_balance - old_active_balance + amount` encrypts zero — exactly what the
+/// on-chain `unwrap` verifier checks (`account.balance = new_balance + amount`).
+/// Unlike `unwrap_proof`, which needs a caller-formed residual, this derives the
+/// residual itself and yields every component `unwrap` requires.
+///
+/// Pure prover: performs no overspend check and never decrypts `old_active_balance`.
+/// The caller must pass `new_balance = decrypt(old_active_balance) - amount` and
+/// reject overspend client-side, as `batched_transfer_proofs` already requires.
+///
+/// Returns `{"new_balance_amount": bytes(256), "range_proofs": list[bytes],
+/// "consistency_proofs": list[bytes(512)], "balance_proof": bytes(96)}`. Both lists
+/// always hold exactly one element; they are lists to mirror `batched_transfer_proofs`.
+#[pyfunction]
+fn unwrap_proofs<'py>(
+    py: Python<'py>,
+    sender_private_key: &[u8],
+    sender_public_key: &[u8],
+    old_active_balance: &[u8],
+    amount: u64,
+    new_balance: u64,
+    session_id: &[u8],
+) -> PyResult<Bound<'py, PyDict>> {
+    let sk = private_key_from_bytes(sender_private_key)?;
+    let pk = point_from_bytes(sender_public_key, "sender_public_key")?;
+
+    let old_balance: [u8; 256] = old_active_balance
+        .try_into()
+        .map_err(|_| PyValueError::new_err("old_active_balance must be exactly 256 bytes"))?;
+
+    let session = session_id_from_bytes(session_id)?;
+
+    let result = proofs::unwrap_proofs(&sk, &pk, &old_balance, amount, new_balance, &session)
+        .map_err(ct_value_error)?;
+
+    let dict = PyDict::new(py);
+
+    dict.set_item(
+        "new_balance_amount",
+        PyBytes::new(py, &result.new_balance_amount),
+    )?;
+
+    dict.set_item(
+        "range_proofs",
+        PyList::new(
+            py,
+            result
+                .range_proofs
+                .iter()
+                .map(|v| PyBytes::new(py, v))
+                .collect::<Vec<_>>(),
+        )?,
+    )?;
+
+    dict.set_item(
+        "consistency_proofs",
+        PyList::new(
+            py,
+            result
+                .consistency_proofs
+                .iter()
+                .map(|ba| PyBytes::new(py, ba))
+                .collect::<Vec<_>>(),
+        )?,
+    )?;
+
+    dict.set_item("balance_proof", PyBytes::new(py, &result.balance_proof))?;
+
+    // sk (Zeroizing<RistrettoScalar>) is dropped here, zeroizing the scalar
+    Ok(dict)
+}
+
 /// Construct a batched confidential transfer with encrypted amounts and zero-knowledge proofs.
 ///
 /// Returns `{"encrypted_amounts": list[bytes], "new_balance_amount": bytes(256),
@@ -401,6 +475,7 @@ pub fn register_ct(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encrypt_amount_with_proofs, m)?)?;
     m.add_function(wrap_pyfunction!(register_with_auditors, m)?)?;
     m.add_function(wrap_pyfunction!(unwrap_proof, m)?)?;
+    m.add_function(wrap_pyfunction!(unwrap_proofs, m)?)?;
     m.add_function(wrap_pyfunction!(batched_transfer_proofs, m)?)?;
     m.add_function(wrap_pyfunction!(rekey_proofs, m)?)?;
     m.add_function(wrap_pyfunction!(recover_transfer_randomness, m)?)?;
@@ -489,5 +564,98 @@ mod tests {
         assert!(decrypt_transfer_amount(&handle, batch_index + 1, &enc).is_err());
         // Wrong length -> error.
         assert!(decrypt_transfer_amount(&handle, batch_index, &enc[..255]).is_err());
+    }
+
+    /// End-to-end derivation check for `unwrap_proofs`: builds a real encrypted
+    /// balance, unwraps a public amount, then re-derives the residual exactly as the
+    /// on-chain Move verifier does (`balance::try_split_to_public` ->
+    /// `twisted_elgamal::sub_assign_u64` -> `encrypted_amount::verify_equal`).
+    ///
+    /// `unwrap_proof_binding_output_verifies` hands the binding a trivial pre-built
+    /// zero-encryption; it never exercises derivation from real balance state, which
+    /// is the whole point of `unwrap_proofs`. In particular this pins the public term
+    /// to `amount*H` on the commitment with the identity on the handle -- substituting
+    /// `G` for `H` still produces a well-formed DDH proof, and fails only here.
+    #[test]
+    fn unwrap_proofs_residual_matches_move_verifier() {
+        use crate::ct::cipher::{self, Ciphertext};
+        use crate::ct::generators::h;
+
+        let sk = random_private_key();
+        let pk = public_key(&sk);
+        let session_id = [9u8; 20];
+
+        // Limb-wise: old = [4, 3, 2, 1], amount = [1, 1, 1, 0] -> no borrow.
+        let old_value: u64 = 0x0001_0002_0003_0004;
+        let amount: u64 = 0x0000_0001_0001_0001;
+        let new_value: u64 = old_value - amount;
+
+        // A real 256-byte encrypted active balance: four 16-bit limbs, random blindings.
+        let mut old_active_balance = Vec::with_capacity(256);
+        for l in 0..4 {
+            let v = ((old_value >> (16 * l)) & 0xffff) as u32;
+            old_active_balance.extend_from_slice(&Ciphertext::encrypt(&pk, v).to_bytes());
+        }
+
+        Python::initialize();
+        let (nb_bytes, balance_proof, n_range, n_cons, cons_len) = Python::attach(|py| {
+            let d = unwrap_proofs(
+                py,
+                &sk.to_byte_array(),
+                &pk.to_byte_array(),
+                &old_active_balance,
+                amount,
+                new_value,
+                &session_id,
+            )
+            .expect("binding succeeds");
+            let get = |k: &str| d.get_item(k).expect("get_item").expect("key present");
+            let nb: Vec<u8> = get("new_balance_amount").extract().expect("bytes");
+            let bp: Vec<u8> = get("balance_proof").extract().expect("bytes");
+            let rps: Vec<Vec<u8>> = get("range_proofs").extract().expect("list[bytes]");
+            let cps: Vec<Vec<u8>> = get("consistency_proofs").extract().expect("list[bytes]");
+            (nb, bp, rps.len(), cps.len(), cps[0].len())
+        });
+
+        assert_eq!(nb_bytes.len(), 256);
+        assert_eq!(balance_proof.len(), 96);
+        assert_eq!(n_range, 1);
+        assert_eq!(n_cons, 1);
+        assert_eq!(cons_len, 512);
+
+        // Re-derive the residual the way the Move verifier does.
+        let parse = |b: &[u8]| -> [Ciphertext; 4] {
+            std::array::from_fn(|l| {
+                Ciphertext::from_bytes(&b[l * 64..(l + 1) * 64]).expect("limb parses")
+            })
+        };
+        let old_collapsed = cipher::collapse_encrypted(&parse(&old_active_balance));
+        let nb_collapsed = cipher::collapse_encrypted(&parse(&nb_bytes));
+
+        let residual_commitment = nb_collapsed.commitment - old_collapsed.commitment
+            + h() * RistrettoScalar::from(amount);
+        let residual_handle = nb_collapsed.decryption_handle - old_collapsed.decryption_handle;
+
+        // The residual must be a zero-encryption under sk: D = sk*C.
+        assert_eq!(
+            (residual_commitment * sk).to_byte_array(),
+            residual_handle.to_byte_array(),
+            "residual must encrypt zero under the sender key"
+        );
+
+        // The emitted DDH proof must verify against that exact tuple, DST = sid || 0x01.
+        let proof: DdhTupleNizk<RistrettoPoint> =
+            bcs::from_bytes(&balance_proof).expect("DDH proof deserializes");
+        let mut dst = session_id.to_vec();
+        dst.push(0x01);
+        proof
+            .verify(&g(), &residual_commitment, &pk, &residual_handle, &dst)
+            .expect("balance proof verifies against Move-derived residual");
+
+        // An off-by-one public amount breaks the zero-encryption; proof must not verify.
+        let bad_commitment = residual_commitment + h() * RistrettoScalar::from(1u64);
+        assert!(proof
+            .verify(&g(), &bad_commitment, &pk, &residual_handle, &dst)
+            .is_err());
     }
 }
