@@ -1,3 +1,5 @@
+from typing import TypedDict
+
 def generate_ephemeral_keypair(as_secp256r1: bool = False) -> dict[str, bytes]: ...
 def extract_jwt_claims(jwt: str) -> tuple[str, str, str, str]: ...
 def compute_nonce(epk_bytes: bytes, max_epoch: int, randomness: str) -> str: ...
@@ -111,6 +113,35 @@ def unwrap_proof(
     session_id: bytes,
 ) -> bytes: ...
 
+class UnwrapProofs(TypedDict):
+    """Return shape of :func:`unwrap_proofs`: zero-knowledge proofs and the new
+    encrypted balance produced when withdrawing (unwrapping) private funds."""
+
+    new_balance_amount: bytes
+    range_proofs: list[bytes]
+    consistency_proofs: list[bytes]
+    balance_proof: bytes
+
+class BatchedTransferProofs(TypedDict):
+    """Return shape of :func:`batched_transfer_proofs`: per-recipient encrypted
+    amounts and the zero-knowledge proofs for a batched confidential transfer."""
+
+    encrypted_amounts: list[bytes]
+    new_balance_amount: bytes
+    range_proofs: list[bytes]
+    consistency_proofs: list[bytes]
+    sender_total_consistency_proof: bytes
+    balance_proof: bytes
+    total_sender_handle: bytes
+    seed_point: bytes
+
+class RekeyProofs(TypedDict):
+    """Return shape of :func:`rekey_proofs`: the rotated decryption handles and
+    the rekey consistency proof for a confidential-balance key rotation."""
+
+    new_handles: list[bytes]
+    rekey_proof: bytes
+
 def unwrap_proofs(
     sender_private_key: bytes,
     sender_public_key: bytes,
@@ -118,7 +149,7 @@ def unwrap_proofs(
     amount: int,
     new_balance: int,
     session_id: bytes,
-) -> dict[str, bytes | list[bytes]]: ...
+) -> UnwrapProofs: ...
 
 def batched_transfer_proofs(
     sender_private_key: bytes,
@@ -127,7 +158,7 @@ def batched_transfer_proofs(
     recipients: list[tuple[bytes, int]],
     new_balance: int,
     session_id: bytes,
-) -> dict[str, bytes | list[bytes]]: ...
+) -> BatchedTransferProofs: ...
 
 def rekey_proofs(
     old_private_key: bytes,
@@ -136,4 +167,4 @@ def rekey_proofs(
     new_public_key: bytes,
     active_balance: bytes,
     session_id: bytes,
-) -> dict[str, bytes | list[bytes]]: ...
+) -> RekeyProofs: ...

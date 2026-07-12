@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - Unpublished
+
+### Added
+
+### Fixed
+
+### Changed
+
+- `unwrap_proofs`, `batched_transfer_proofs`, and `rekey_proofs` now declare precise `TypedDict` return types (`UnwrapProofs`, `BatchedTransferProofs`, `RekeyProofs`) in the type stub, replacing the ambiguous `dict[str, bytes | list[bytes]]` union
+
+### Removed
+
 ## [0.2.0] - Unpublished
 
 ### Added
