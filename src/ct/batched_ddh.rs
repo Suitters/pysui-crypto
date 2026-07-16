@@ -7,7 +7,14 @@
 //! Used for batched re-keying (Π_rekey in the SEAL/confidential-transfers protocol).
 //!
 //! Hand-rolled to replicate the on-chain Move verifier bit-for-bit.
-//! See nizk.move:prove_batched_ddh, verify_batched_ddh, challenge_batched_ddh.
+//! See `nizk.move`: `prove_ddh`, `verify_ddh`, `challenge_ddh`.
+//!
+//! Upstream note (confidential-transfers PR #19, "Batch nizks"): Move merged
+//! `BatchedDdhProof` into `DdhProof` and renamed `prove_batched_ddh` /
+//! `verify_batched_ddh` / `challenge_batched_ddh` to `prove_ddh` / `verify_ddh` /
+//! `challenge_ddh`. That rename was body-identical: the `{commitments, z}` shape
+//! and the 192-byte rekey wire form are UNCHANGED, so this module required no code
+//! change — only these doc references. The old names no longer exist upstream.
 
 use fastcrypto::groups::ristretto255::{RistrettoPoint, RistrettoScalar};
 use fastcrypto::serde_helpers::ToFromByteArray;
@@ -27,7 +34,7 @@ impl BatchedDdhProof {
     /// Prove that a single witness `w` maps every base to its image:
     /// `images[k] == w * bases[k]` for all `k`.
     ///
-    /// Mirrors Move's `prove_batched_ddh` (nizk.move:543-554):
+    /// Mirrors Move's `prove_ddh` (named `prove_batched_ddh` before PR #19):
     /// - Sample one shared nonce `s` (single randomness for all tuples).
     /// - Compute commitments[k] = s * bases[k].
     /// - Challenge c = fiat_shamir(dst, bases, images, commitments).
@@ -57,7 +64,7 @@ impl BatchedDdhProof {
 
     /// Verify that the proof is valid: for all k, commitment[k] + c*image[k] == z*base[k].
     ///
-    /// Mirrors Move's `verify_batched_ddh` (nizk.move:130-143):
+    /// Mirrors Move's `verify_ddh` (named `verify_batched_ddh` before PR #19):
     /// - Check length consistency: bases.len() == images.len() == commitments.len().
     /// - Recompute challenge identically.
     /// - For each k, verify: commitment[k] + c*image[k] == z*base[k].
@@ -88,7 +95,7 @@ impl BatchedDdhProof {
 
     /// Fiat-Shamir challenge for a batched DDH proof.
     /// Binds, in order: dst, every base, every image, every commitment.
-    /// Mirrors Move's `challenge_batched_ddh` (nizk.move:265-276).
+    /// Mirrors Move's `challenge_ddh` (named `challenge_batched_ddh` before PR #19).
     fn challenge(
         dst: &[u8],
         bases: &[RistrettoPoint],

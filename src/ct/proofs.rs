@@ -3,10 +3,16 @@
 
 //! Confidential-transfer zero-knowledge proofs.
 //!
-//! The key-consistency proof is hand-rolled (fastcrypto's `KeyConsistencyProof`
-//! is non-serialisable with private fields), replicating fastcrypto's exact
-//! `prove` + Fiat-Shamir `challenge` (rev c6010b9) so the transcript matches the
-//! on-chain Move verifier bit-for-bit, but emitting the flat Move wire form.
+//! The key-consistency and batched-ElGamal consistency proofs are hand-rolled
+//! (fastcrypto's `KeyConsistencyProof` is non-serialisable with private fields,
+//! and fastcrypto exposes no batched-ElGamal API), replicating fastcrypto's exact
+//! `prove` + Fiat-Shamir `challenge` so the transcript matches the on-chain Move
+//! verifier bit-for-bit, but emitting the flat Move wire form.
+//!
+//! Dependency note: this crate builds against crates.io `fastcrypto = "=0.1.11"`
+//! (see Cargo.toml) — NOT a git rev, and NOT a local clone. Verify any claim about
+//! fastcrypto internals against the vendored 0.1.11 source under
+//! `~/.cargo/registry`; a checkout of the fastcrypto repo may not match.
 
 use crate::ct::cipher;
 use crate::ct::generators::{g, h};
@@ -60,6 +66,147 @@ pub fn fiat_shamir_challenge(chunks: &[Vec<u8>]) -> RistrettoScalar {
 /// Deprecated alias for backward compatibility. Use fiat_shamir_challenge instead.
 fn fiat_shamir(chunks: &[Vec<u8>]) -> RistrettoScalar {
     fiat_shamir_challenge(chunks)
+}
+
+/// A twisted-ElGamal consistency proof folded over `n` ciphertexts that share a
+/// single public key: proves knowledge of `(r_j, m_j)` with `C_j = G*r_j + H*m_j`
+/// and `D_j = pk*r_j` for every `j`, in one 128-byte proof.
+///
+/// Mirrors the on-chain Move `ElGamalProof` and `nizk::verify_elgamal`. The wire
+/// form is `a(32) || b(32) || z1(32) || z2(32)`, matching Move's
+/// `decode::elgamal_proof` part order and fastcrypto's `ConsistencyProof` field
+/// order (`a1, a2, z1, z2`) — so a batch of one is byte-identical to a fastcrypto
+/// single-ciphertext proof, and `verify_elgamal` accepts either.
+pub struct BatchedConsistencyProof {
+    a: RistrettoPoint,
+    b: RistrettoPoint,
+    z1: RistrettoScalar,
+    z2: RistrettoScalar,
+}
+
+impl BatchedConsistencyProof {
+    /// Fiat-Shamir transcript, binding the whole batch in Move's exact order:
+    /// `dst, G, H, pk, (C_0, D_0), .., (C_{n-1}, D_{n-1}), a, b`.
+    ///
+    /// Drawing the challenge only after committing to every ciphertext is what
+    /// stops a prover from choosing a batch the aggregate would mask, and is why
+    /// a proof cannot be replayed against a shorter, longer, or reordered batch.
+    fn challenge(
+        dst: &[u8],
+        encryption_key: &RistrettoPoint,
+        ciphertexts: &[cipher::Ciphertext],
+        a: &RistrettoPoint,
+        b: &RistrettoPoint,
+    ) -> RistrettoScalar {
+        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(6 + 2 * ciphertexts.len());
+        chunks.push(dst.to_vec());
+        chunks.push(g().to_byte_array().to_vec());
+        chunks.push(h().to_byte_array().to_vec());
+        chunks.push(encryption_key.to_byte_array().to_vec());
+        for ct in ciphertexts {
+            chunks.push(ct.commitment.to_byte_array().to_vec());
+            chunks.push(ct.decryption_handle.to_byte_array().to_vec());
+        }
+        chunks.push(a.to_byte_array().to_vec());
+        chunks.push(b.to_byte_array().to_vec());
+        fiat_shamir_challenge(&chunks)
+    }
+
+    /// Fold `ciphertexts` (all encrypted under `encryption_key`) into one proof.
+    ///
+    /// `messages[j]` and `blindings[j]` must be the plaintext and randomness of
+    /// `ciphertexts[j]`; slice order is part of the transcript, so it must match
+    /// the order the verifier will supply (little-endian limb order on-chain).
+    fn prove(
+        dst: &[u8],
+        encryption_key: &RistrettoPoint,
+        ciphertexts: &[cipher::Ciphertext],
+        messages: &[u64],
+        blindings: &[RistrettoScalar],
+    ) -> FastCryptoResult<Self> {
+        let n = ciphertexts.len();
+        if n == 0 || messages.len() != n || blindings.len() != n {
+            return Err(FastCryptoError::InvalidInput);
+        }
+
+        // `ma` masks the aggregate blinding (the G/pk side), `mb` the aggregate
+        // message (the H side).
+        let ma = Zeroizing::new(rand_scalar());
+        let mb = Zeroizing::new(rand_scalar());
+        let a = *encryption_key * *ma;
+        let b = g() * *ma + h() * *mb;
+
+        let c = Self::challenge(dst, encryption_key, ciphertexts, &a, &b);
+
+        // z1 = ma + SUM_j c^(j+1) * r_j ; z2 = mb + SUM_j c^(j+1) * m_j.
+        //
+        // Powers start at c^1 here while `verify` aggregates from c^0 = 1. That
+        // asymmetry is deliberate and load-bearing: the verifier's outer `c * agg`
+        // term supplies the missing factor. Starting both at c^1 type-checks and
+        // fails verification, looking exactly like a transcript bug.
+        let mut z1 = *ma;
+        let mut z2 = *mb;
+        let mut power = c;
+        for j in 0..n {
+            z1 += blindings[j] * power;
+            z2 += RistrettoScalar::from(messages[j]) * power;
+            power = power * c;
+        }
+
+        Ok(Self { a, b, z1, z2 })
+    }
+
+    /// Flat Move wire form: `a || b || z1 || z2` (128 bytes).
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        out.extend_from_slice(&self.a.to_byte_array());
+        out.extend_from_slice(&self.b.to_byte_array());
+        out.extend_from_slice(&self.z1.to_byte_array());
+        out.extend_from_slice(&self.z2.to_byte_array());
+        out
+    }
+
+    /// Parse the flat Move wire form `a || b || z1 || z2` (128 bytes).
+    #[cfg(test)]
+    fn from_bytes(bytes: &[u8]) -> FastCryptoResult<Self> {
+        if bytes.len() != 128 {
+            return Err(FastCryptoError::InvalidInput);
+        }
+        let chunk = |o: usize| -> [u8; 32] { bytes[o..o + 32].try_into().expect("32-byte chunk") };
+        Ok(Self {
+            a: RistrettoPoint::from_byte_array(&chunk(0))?,
+            b: RistrettoPoint::from_byte_array(&chunk(32))?,
+            z1: RistrettoScalar::from_byte_array(&chunk(64))?,
+            z2: RistrettoScalar::from_byte_array(&chunk(96))?,
+        })
+    }
+
+    /// Re-verify a folded proof, replicating Move's `verify_elgamal` exactly.
+    /// Test-only: the on-chain verifier is the real consumer.
+    #[cfg(test)]
+    fn verify(
+        &self,
+        dst: &[u8],
+        encryption_key: &RistrettoPoint,
+        ciphertexts: &[cipher::Ciphertext],
+    ) -> bool {
+        let c = Self::challenge(dst, encryption_key, ciphertexts, &self.a, &self.b);
+
+        // Aggregate with powers from c^0 = 1 — see the note in `prove`.
+        let mut agg_c = RistrettoPoint::zero();
+        let mut agg_d = RistrettoPoint::zero();
+        let mut power = RistrettoScalar::from(1u64);
+        for ct in ciphertexts {
+            agg_c += ct.commitment * power;
+            agg_d += ct.decryption_handle * power;
+            power = power * c;
+        }
+
+        // Eq 1 (handles):     a + c*agg_d == z1*pk
+        // Eq 2 (ciphertexts): b + c*agg_c == z1*G + z2*H
+        self.a + agg_d * c == *encryption_key * self.z1
+            && self.b + agg_c * c == g() * self.z1 + h() * self.z2
+    }
 }
 
 /// A hand-rolled key-consistency proof over `KEY_LIMB_COUNT` private-key limbs
@@ -305,10 +452,9 @@ pub struct AmountEncryption {
 }
 
 /// Encrypt a `u64` amount to `recipient_public_key` as four 16-bit Twisted-ElGamal
-/// limbs, each with an ElGamal-consistency proof, plus one aggregated 16-bit range
-/// proof over all limbs. Consistency DST = session_id ‖ 0x02 (ELGAMAL); range DST =
-/// session_id ‖ 0x04 (RANGE_PROOF_16). Ciphertext and proof bytes come straight from
-/// fastcrypto so the emitted encryption is exactly what the proof attests to.
+/// limbs under ONE folded ElGamal-consistency proof over all four limbs, plus one
+/// aggregated 16-bit range proof. Consistency DST = session_id ‖ 0x02 (ELGAMAL);
+/// range DST = session_id ‖ 0x04 (RANGE_PROOF_16).
 ///
 /// The aggregated range proof reuses each limb's twisted-ElGamal blinding and
 /// shares generators with the ciphertext commitments (same G/H), so the
@@ -320,42 +466,32 @@ pub fn encrypt_amount_with_proofs(
     amount: u64,
     session_id: &[u8; 20],
 ) -> FastCryptoResult<AmountEncryption> {
-    // Bridge the raw recipient point into fastcrypto's `PublicKey` newtype via its
-    // (identical) BCS form — fastcrypto exposes no direct point constructor.
-    let encryption_key: PublicKey = bcs::from_bytes(
-        &bcs::to_bytes(recipient_public_key).expect("serialize recipient point"),
-    )
-    .expect("recipient point into PublicKey");
-
     let limbs: [u16; 4] = std::array::from_fn(|i| ((amount >> (16 * i)) & 0xFFFF) as u16);
 
     let mut dst_cons = session_id.to_vec();
     dst_cons.push(0x02);
 
-    let mut encrypted_amount = Vec::with_capacity(256);
-    let mut consistency_proof = Vec::with_capacity(512);
-    let mut blindings = ScrubbedBlindings(Vec::with_capacity(4));
-    for &limb in &limbs {
-        let (ciphertext, blinding, proof) = Ciphertext::encrypt_with_consistency_proof(
-            &encryption_key,
-            limb as u32,
-            &dst_cons,
-            &mut thread_rng(),
-        )?;
-        encrypted_amount
-            .extend_from_slice(&bcs::to_bytes(&ciphertext).expect("serialize ciphertext"));
-        consistency_proof
-            .extend_from_slice(&bcs::to_bytes(&proof).expect("serialize consistency proof"));
-        blindings.0.push(blinding);
-    }
+    // Fresh per-limb blindings, scrubbed on every exit path. `prepare_amount` is the
+    // primitive; this wrapper only samples the randomness and adds the range proof.
+    let blindings = Zeroizing::new([
+        rand_scalar(),
+        rand_scalar(),
+        rand_scalar(),
+        rand_scalar(),
+    ]);
+    let prepared = prepare_amount(recipient_public_key, amount, &blindings, &dst_cons)?;
 
     // Aggregated 16-bit range proof over the four limbs, DST = session_id ‖ 0x04.
+    // Reuses the same blindings and shares G/H with the ciphertext commitments, so
+    // the bulletproof commitments equal the TE commitments — the binding the
+    // on-chain Move verifier requires.
     let mut dst_rp = session_id.to_vec();
     dst_rp.push(0x04);
     let values: Zeroizing<Vec<u64>> = Zeroizing::new(limbs.iter().map(|&l| l as u64).collect());
+    let rp_blindings = ScrubbedBlindings(blindings.iter().map(|b| Blinding(*b)).collect());
     let range_proof = RangeProof::prove_batch(
         &values,
-        &blindings.0,
+        &rp_blindings.0,
         &Range::Bits16,
         &dst_rp,
         &mut thread_rng(),
@@ -363,8 +499,8 @@ pub fn encrypt_amount_with_proofs(
     .to_bytes();
 
     Ok(AmountEncryption {
-        encrypted_amount,
-        consistency_proof,
+        encrypted_amount: prepared.encrypted_amount_bytes,
+        consistency_proof: prepared.consistency_proof_bytes,
         range_proof,
     })
 }
@@ -379,8 +515,8 @@ pub struct PreparedAmount {
     pub limb_ciphertexts: [Ciphertext; 4],
     /// 256 bytes: four ciphertexts, each `commitment(32) || handle(32)`.
     pub encrypted_amount_bytes: Vec<u8>,
-    /// 512 bytes: four fastcrypto consistency proofs, each
-    /// `a1(32) || a2(32) || z1(32) || z2(32)`.
+    /// 128 bytes: ONE folded consistency proof over all four limbs,
+    /// `a(32) || b(32) || z1(32) || z2(32)`.
     pub consistency_proof_bytes: Vec<u8>,
 }
 
@@ -404,18 +540,14 @@ pub fn prepare_amount(
     blindings: &[RistrettoScalar; 4],
     dst_elgamal: &[u8],
 ) -> FastCryptoResult<PreparedAmount> {
-    // Bridge the raw recipient point into fastcrypto's `PublicKey` newtype via its
-    // (identical) BCS form — fastcrypto exposes no direct point constructor.
-    let encryption_key: PublicKey =
-        bcs::from_bytes(&bcs::to_bytes(public_key).expect("serialize recipient point"))
-            .expect("recipient point into PublicKey");
-
     let mut encrypted_amount_bytes = Vec::with_capacity(256);
-    let mut consistency_proof_bytes = Vec::with_capacity(512);
     let mut limb_ciphertexts: Vec<Ciphertext> = Vec::with_capacity(4);
+    let mut pysui_cts: Vec<cipher::Ciphertext> = Vec::with_capacity(4);
+    let mut messages = [0u64; 4];
 
     for l in 0..4 {
         let limb_value = ((amount >> (16 * l)) & 0xFFFF) as u32;
+        messages[l] = limb_value as u64;
 
         // pysui-crypto ciphertext with the caller's blinding: commitment = H*m + G*b,
         // handle = pk*b. Serialise to the 64-byte raw wire form (commitment||handle).
@@ -433,21 +565,17 @@ pub fn prepare_amount(
             "BCS bridge must be byte-faithful",
         );
 
-        // Per-limb consistency proof over the caller's blinding.
-        let proof = ConsistencyProof::prove(
-            &RistrettoScalar::from(limb_value as u64),
-            &fc_ct,
-            &Blinding(blindings[l]),
-            &encryption_key,
-            dst_elgamal,
-            &mut thread_rng(),
-        )?;
-
         encrypted_amount_bytes.extend_from_slice(&ct_bytes);
-        consistency_proof_bytes
-            .extend_from_slice(&bcs::to_bytes(&proof).expect("serialize consistency proof"));
         limb_ciphertexts.push(fc_ct);
+        pysui_cts.push(pysui_ct);
     }
+
+    // ONE folded consistency proof over all four limbs. They share `public_key`, so
+    // the batched relation applies and what was four 128-byte per-limb proofs
+    // collapses to a single 128-byte proof.
+    let consistency_proof_bytes =
+        BatchedConsistencyProof::prove(dst_elgamal, public_key, &pysui_cts, &messages, blindings)?
+            .to_bytes();
 
     let limb_ciphertexts: [Ciphertext; 4] = limb_ciphertexts
         .try_into()
@@ -551,7 +679,7 @@ pub fn unwrap_proof(
 pub struct UnwrapProofs {
     pub new_balance_amount: [u8; 256],
     pub range_proofs: Vec<Vec<u8>>,
-    pub consistency_proofs: Vec<[u8; 512]>,
+    pub consistency_proofs: Vec<[u8; 128]>,
     pub balance_proof: Vec<u8>,
 }
 
@@ -606,7 +734,7 @@ pub fn unwrap_proofs(
 
     let mut new_balance_amount = [0u8; 256];
     new_balance_amount.copy_from_slice(&enc.encrypted_amount);
-    let mut consistency_proof = [0u8; 512];
+    let mut consistency_proof = [0u8; 128];
     consistency_proof.copy_from_slice(&enc.consistency_proof);
 
     // Collapse both balances' four 16-bit limbs into a single ciphertext each.
@@ -648,7 +776,7 @@ pub struct BatchedTransferProofs {
     pub encrypted_amounts: Vec<[u8; 256]>,
     pub new_balance_amount: [u8; 256],
     pub range_proofs: Vec<Vec<u8>>,
-    pub consistency_proofs: Vec<[u8; 512]>,
+    pub consistency_proofs: Vec<[u8; 128]>,
     pub sender_total_consistency_proof: Vec<u8>,
     pub balance_proof: Vec<u8>,
     pub total_sender_handle: [u8; 32],
@@ -722,10 +850,10 @@ pub fn batched_transfer_proofs(
     amounts_in_order.push((new_balance, nb_blindings));
 
     // Step 6: Prepare consistency_proofs return vector
-    let consistency_proofs: Vec<[u8; 512]> = consistency_proofs_vec
+    let consistency_proofs: Vec<[u8; 128]> = consistency_proofs_vec
         .iter()
         .map(|cp| {
-            let mut arr = [0u8; 512];
+            let mut arr = [0u8; 128];
             arr.copy_from_slice(cp);
             arr
         })
@@ -930,8 +1058,12 @@ mod tests {
             .expect("amount encryption");
         // 4 limbs, each Twisted-ElGamal ciphertext = commitment(32) ‖ handle(32).
         assert_eq!(enc.encrypted_amount.len(), 256, "encrypted_amount must be 4x64 bytes");
-        // 4 per-limb consistency proofs, each a1(32) ‖ a2(32) ‖ z1(32) ‖ z2(32).
-        assert_eq!(enc.consistency_proof.len(), 512, "consistency proof must be 4x128 bytes");
+        // ONE folded consistency proof over all four limbs: a(32) ‖ b(32) ‖ z1(32) ‖ z2(32).
+        assert_eq!(
+            enc.consistency_proof.len(),
+            128,
+            "consistency proof must be one folded 128-byte proof"
+        );
         assert!(!enc.range_proof.is_empty());
     }
 
@@ -1072,6 +1204,82 @@ mod tests {
         assert_eq!(proof.to_bytes().len(), expected);
     }
 
+    /// Pin our ElGamal Fiat-Shamir transcript against the REFERENCE Move
+    /// implementation's own regression vector, lifted verbatim from
+    /// `nizk.move::challenge_transcript_regression` (confidential-transfers PR #19).
+    ///
+    /// Round-trip tests only prove our prover and our verifier agree with each
+    /// other — they cannot catch the two drifting together. This proves we agree
+    /// with the chain.
+    #[test]
+    fn challenge_elgamal_matches_move_regression_vector() {
+        // Move: dst = vector::tabulate!(21, |i| i as u8);
+        //       points[i] = g_mul(&scalar_from_u64((i + 1) * 11), &g_generator())
+        let dst: Vec<u8> = (0..21u8).collect();
+        let base = RistrettoPoint::generator();
+        let points: Vec<RistrettoPoint> = (0..6)
+            .map(|i| base * RistrettoScalar::from(((i + 1) * 11) as u64))
+            .collect();
+
+        // Move: encryptions = [twisted_elgamal::new(points[0], points[1]),
+        //                      twisted_elgamal::new(points[2], points[3])]
+        // where `new(ciphertext, decryption_handle)`.
+        let encryptions = vec![
+            cipher::Ciphertext {
+                commitment: points[0],
+                decryption_handle: points[1],
+            },
+            cipher::Ciphertext {
+                commitment: points[2],
+                decryption_handle: points[3],
+            },
+        ];
+
+        // Move: challenge_elgamal(dst, g, h, pk = points[4], encryptions,
+        //                         a = points[5], b = points[0])
+        let c = BatchedConsistencyProof::challenge(
+            &dst,
+            &points[4],
+            &encryptions,
+            &points[5],
+            &points[0],
+        );
+
+        assert_eq!(
+            hex::encode(c.to_byte_array()),
+            "bfc70a5eb7a3d6ff45c7f259078b46d3d1a1cd1c8f9affe06b3d37bb40548900",
+            "ElGamal challenge transcript must byte-match the Move verifier",
+        );
+    }
+
+    /// Same reference vector, DDH side. We do not call fastcrypto's
+    /// `DdhTupleNizk::challenge` here (it is private), but Move's
+    /// `challenge_ddh(dst, bases, images, commitments)` flattens to
+    /// `[dst, b0, b1, i0, i1, c0, c1]`, which for the n=2 case is the SAME sequence
+    /// fastcrypto absorbs as `[dst, g, h, x_g, x_h, a, b]`. Pinning this vector is
+    /// what justifies leaving `DdhTupleNizk` untouched against the batched verifier.
+    #[test]
+    fn challenge_ddh_matches_move_regression_vector() {
+        let dst: Vec<u8> = (0..21u8).collect();
+        let base = RistrettoPoint::generator();
+        let points: Vec<RistrettoPoint> = (0..6)
+            .map(|i| base * RistrettoScalar::from(((i + 1) * 11) as u64))
+            .collect();
+
+        // Move: challenge_ddh(dst, bases = [p0, p1], images = [p2, p3],
+        //                     commitments = [p4, p5])
+        let chunks: Vec<Vec<u8>> = std::iter::once(dst)
+            .chain(points.iter().map(|p| p.to_byte_array().to_vec()))
+            .collect();
+        let c = fiat_shamir_challenge(&chunks);
+
+        assert_eq!(
+            hex::encode(c.to_byte_array()),
+            "b5baa7c858c0eb740d9c38cc273f2062998dad57a798fa00e78cc33b4ba54200",
+            "DDH challenge transcript must byte-match the Move verifier",
+        );
+    }
+
     #[test]
     #[allow(clippy::needless_range_loop)]
     fn prepare_amount_produces_verifiable_limb_proofs() {
@@ -1096,25 +1304,50 @@ mod tests {
 
         // Wire lengths: 4 ciphertexts * 64, 4 consistency proofs * 128.
         assert_eq!(prepared.encrypted_amount_bytes.len(), 256);
-        assert_eq!(prepared.consistency_proof_bytes.len(), 512);
+        assert_eq!(prepared.consistency_proof_bytes.len(), 128);
 
-        // Bridge pk into fastcrypto `PublicKey` for verification.
-        let encryption_key: PublicKey =
-            bcs::from_bytes(&bcs::to_bytes(&pk).expect("serialize pk")).expect("pk into PublicKey");
+        // Re-parse the limb ciphertexts from the WIRE bytes, not the in-memory
+        // objects — these are exactly what the on-chain verifier is handed.
+        let parse_wire_limbs = || -> Vec<cipher::Ciphertext> {
+            (0..LIMB_COUNT)
+                .map(|l| {
+                    cipher::Ciphertext::from_bytes(
+                        &prepared.encrypted_amount_bytes[l * 64..(l + 1) * 64],
+                    )
+                })
+                .collect::<FastCryptoResult<_>>()
+                .expect("limb ciphertexts parse from wire bytes")
+        };
+        let wire_limbs = parse_wire_limbs();
+
+        // (a) ONE folded proof, parsed back off the wire, verifies against all
+        //     four limbs at once.
+        let folded = BatchedConsistencyProof::from_bytes(&prepared.consistency_proof_bytes)
+            .expect("folded consistency proof parses from wire bytes");
+        assert!(
+            folded.verify(&dst_elgamal, &pk, &wire_limbs),
+            "folded consistency proof must verify against all four limb ciphertexts",
+        );
+
+        // The challenge binds the whole batch in order, so a reordered batch must
+        // NOT verify. This is what catches a transcript that fails to bind order.
+        let mut swapped = parse_wire_limbs();
+        swapped.swap(0, 1);
+        assert!(
+            !folded.verify(&dst_elgamal, &pk, &swapped),
+            "folded proof must not verify against a reordered batch",
+        );
+
+        // Nor may it verify under a different DST.
+        let mut other_dst = dst_elgamal.clone();
+        other_dst[0] ^= 0xFF;
+        assert!(
+            !folded.verify(&other_dst, &pk, &wire_limbs),
+            "folded proof must not verify under a different DST",
+        );
 
         for l in 0..LIMB_COUNT {
             let limb_value = (amount >> (16 * l)) & 0xFFFF;
-
-            // (a) fastcrypto ConsistencyProof::verify must pass for this limb.
-            let proof: ConsistencyProof =
-                bcs::from_bytes(&prepared.consistency_proof_bytes[l * 128..(l + 1) * 128])
-                    .expect("parse consistency proof");
-            assert!(
-                proof
-                    .verify(&prepared.limb_ciphertexts[l], &encryption_key, &dst_elgamal)
-                    .is_ok(),
-                "limb {l} consistency proof must verify against the bridged ciphertext",
-            );
 
             // (b) Ciphertext ties to the known construction:
             //     commitment == h()*limb + g()*blinding ; handle == pk*blinding.
@@ -1327,33 +1560,27 @@ mod tests {
         // ── ASSERT 3: CONSISTENCY — verify every limb of every amount ───────
         // Receivers 0..N: key is recipient pk.
         for (i, (recipient_pk, _)) in recipients.iter().enumerate() {
-            let pk_fc = to_fc_pubkey(recipient_pk);
-            for l in 0..4 {
-                let ct = parse_limb(&proofs.encrypted_amounts[i], l);
-                let ct_fc: Ciphertext =
-                    bcs::from_bytes(&ct.to_bytes()).expect("limb ct into fastcrypto");
-                let proof: ConsistencyProof =
-                    bcs::from_bytes(&proofs.consistency_proofs[i][l * 128..(l + 1) * 128])
-                        .unwrap_or_else(|e| panic!("{label}: parse consistency r{i} l{l}: {e:?}"));
-                proof
-                    .verify(&ct_fc, &pk_fc, &dst_elgamal)
-                    .unwrap_or_else(|e| panic!("{label}: recipient {i} limb {l} consistency verify failed: {e:?}"));
-            }
+            let limbs: Vec<cipher::Ciphertext> = (0..4)
+                .map(|l| parse_limb(&proofs.encrypted_amounts[i], l))
+                .collect();
+            let proof = BatchedConsistencyProof::from_bytes(&proofs.consistency_proofs[i])
+                .unwrap_or_else(|e| panic!("{label}: parse consistency r{i}: {e:?}"));
+            assert!(
+                proof.verify(&dst_elgamal, recipient_pk, &limbs),
+                "{label}: recipient {i} folded consistency verify failed",
+            );
         }
         // New balance (index N): key is sender pk.
         {
-            let sender_pk_fc = to_fc_pubkey(sender_pk);
-            for l in 0..4 {
-                let ct = parse_limb(&proofs.new_balance_amount, l);
-                let ct_fc: Ciphertext =
-                    bcs::from_bytes(&ct.to_bytes()).expect("nb limb ct into fastcrypto");
-                let proof: ConsistencyProof =
-                    bcs::from_bytes(&proofs.consistency_proofs[n][l * 128..(l + 1) * 128])
-                        .unwrap_or_else(|e| panic!("{label}: parse nb consistency l{l}: {e:?}"));
-                proof
-                    .verify(&ct_fc, &sender_pk_fc, &dst_elgamal)
-                    .unwrap_or_else(|e| panic!("{label}: new_balance limb {l} consistency verify failed: {e:?}"));
-            }
+            let limbs: Vec<cipher::Ciphertext> = (0..4)
+                .map(|l| parse_limb(&proofs.new_balance_amount, l))
+                .collect();
+            let proof = BatchedConsistencyProof::from_bytes(&proofs.consistency_proofs[n])
+                .unwrap_or_else(|e| panic!("{label}: parse nb consistency: {e:?}"));
+            assert!(
+                proof.verify(&dst_elgamal, sender_pk, &limbs),
+                "{label}: new_balance folded consistency verify failed",
+            );
         }
 
         // Recover the receiver blindings from seed_point (what the sender does on-chain),

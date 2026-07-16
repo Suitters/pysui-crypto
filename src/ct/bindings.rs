@@ -117,10 +117,10 @@ fn session_id_from_bytes(bytes: &[u8]) -> PyResult<[u8; 20]> {
         .map_err(|_| PyValueError::new_err("session_id must be exactly 20 bytes"))
 }
 
-/// Encrypt a u64 `amount` to `recipient_public_key` with per-limb consistency
-/// proofs and an aggregated 16-bit range proof.
+/// Encrypt a u64 `amount` to `recipient_public_key` with one folded consistency
+/// proof over all four limbs and an aggregated 16-bit range proof.
 ///
-/// Returns `{"encrypted_amount": bytes(256), "consistency_proof": bytes(512),
+/// Returns `{"encrypted_amount": bytes(256), "consistency_proof": bytes(128),
 /// "range_proof": bytes}`. The Python BCS layer adds the outer Move framing.
 #[pyfunction]
 fn encrypt_amount_with_proofs<'py>(
@@ -209,8 +209,10 @@ fn unwrap_proof<'py>(
 /// reject overspend client-side, as `batched_transfer_proofs` already requires.
 ///
 /// Returns `{"new_balance_amount": bytes(256), "range_proofs": list[bytes],
-/// "consistency_proofs": list[bytes(512)], "balance_proof": bytes(96)}`. Both lists
+/// "consistency_proofs": list[bytes(128)], "balance_proof": bytes(96)}`. Both lists
 /// always hold exactly one element; they are lists to mirror `batched_transfer_proofs`.
+/// Each consistency proof is ONE proof folded over all four limbs, not four
+/// per-limb proofs concatenated.
 #[pyfunction]
 fn unwrap_proofs<'py>(
     py: Python<'py>,
@@ -273,9 +275,11 @@ fn unwrap_proofs<'py>(
 /// Construct a batched confidential transfer with encrypted amounts and zero-knowledge proofs.
 ///
 /// Returns `{"encrypted_amounts": list[bytes], "new_balance_amount": bytes(256),
-/// "range_proofs": list[bytes], "consistency_proofs": list[bytes(512)],
+/// "range_proofs": list[bytes], "consistency_proofs": list[bytes(128)],
 /// "sender_total_consistency_proof": bytes, "balance_proof": bytes(96),
-/// "total_sender_handle": bytes(32), "seed_point": bytes(32)}`.
+/// "total_sender_handle": bytes(32), "seed_point": bytes(32)}`. Each entry in
+/// `consistency_proofs` is ONE proof folded over all four limbs, not four per-limb
+/// proofs concatenated.
 #[pyfunction]
 fn batched_transfer_proofs<'py>(
     py: Python<'py>,
@@ -334,7 +338,7 @@ fn batched_transfer_proofs<'py>(
         .map(|v| PyBytes::new(py, v))
         .collect::<Vec<_>>())?)?;
 
-    // consistency_proofs: Vec<[u8; 512]> -> list[bytes]
+    // consistency_proofs: Vec<[u8; 128]> -> list[bytes]
     dict.set_item("consistency_proofs", PyList::new(py, result.consistency_proofs
         .iter()
         .map(|ba| PyBytes::new(py, ba))
@@ -621,7 +625,7 @@ mod tests {
         assert_eq!(balance_proof.len(), 96);
         assert_eq!(n_range, 1);
         assert_eq!(n_cons, 1);
-        assert_eq!(cons_len, 512);
+        assert_eq!(cons_len, 128);
 
         // Re-derive the residual the way the Move verifier does.
         let parse = |b: &[u8]| -> [Ciphertext; 4] {

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - Unpublished
+
+### Added
+
+- Fiat-Shamir transcript regression tests for the batched ElGamal and DDH challenges, pinned against the reference Move implementation's own published vectors (`nizk.move::challenge_transcript_regression`)
+
+### Fixed
+
+- Corrected the `encrypt_amount_with_proofs`, `unwrap_proofs`, and `batched_transfer_proofs` docstrings — visible from Python via `help()` — which still described `consistency_proof` / `consistency_proofs` as 512-byte per-limb proofs
+- Corrected stale references in `src/ct/batched_ddh.rs` documentation to Move functions renamed by confidential-transfers PR #19 (`prove_batched_ddh` / `verify_batched_ddh` / `challenge_batched_ddh` are now `prove_ddh` / `verify_ddh` / `challenge_ddh`). The rename was body-identical upstream; the proof's wire format is unchanged
+
+### Changed
+
+- Realigned the confidential-transfer proof primitives to [confidential-transfers PR #19](https://github.com/MystenLabs/confidential-transfers/pull/19) ("Batch nizks"). The four per-limb ElGamal consistency proofs are now a single proof folded over all four limbs — `consistency_proofs` entries, and `encrypt_amount_with_proofs`'s `consistency_proof`, are now **128 bytes** where they were previously 512
+- `encrypt_amount_with_proofs` now delegates to `prepare_amount`, which is the single primitive for building the limb ciphertexts and their folded consistency proof
+
+### Removed
+
 ## [0.2.1] - Unpublished
 
 ### Added

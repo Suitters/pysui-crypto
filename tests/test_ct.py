@@ -54,8 +54,8 @@ class TestEncryptAmountWithProofs:
         result = pc.encrypt_amount_with_proofs(pk, 0x1234_5678_9ABC_DEF0, SESSION_ID)
         # 4 limbs, each Twisted-ElGamal ciphertext = commitment(32) + handle(32).
         assert len(result["encrypted_amount"]) == 256
-        # 4 per-limb consistency proofs, each a1(32)+a2(32)+z1(32)+z2(32).
-        assert len(result["consistency_proof"]) == 512
+        # ONE folded consistency proof over all four limbs: a(32)+b(32)+z1(32)+z2(32).
+        assert len(result["consistency_proof"]) == 128
         assert len(result["range_proof"]) > 0
 
     def test_zero_amount(self) -> None:
@@ -277,7 +277,7 @@ class TestBatchedTransferProofs:
 
         # consistency_proofs: N recipients + 1 new_balance = 3
         assert len(result["consistency_proofs"]) == 3
-        assert all(len(cp) == 512 for cp in result["consistency_proofs"])
+        assert all(len(cp) == 128 for cp in result["consistency_proofs"])
 
         assert isinstance(result["sender_total_consistency_proof"], bytes)
         assert isinstance(result["balance_proof"], bytes)
@@ -316,7 +316,7 @@ class TestBatchedTransferProofs:
 
         assert len(result["range_proofs"]) == 1
         assert len(result["consistency_proofs"]) == 2
-        assert all(len(cp) == 512 for cp in result["consistency_proofs"])
+        assert all(len(cp) == 128 for cp in result["consistency_proofs"])
 
         assert len(result["balance_proof"]) == 96
         assert len(result["total_sender_handle"]) == 32
