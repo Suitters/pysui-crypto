@@ -150,7 +150,7 @@ impl BatchedConsistencyProof {
         for j in 0..n {
             z1 += blindings[j] * power;
             z2 += RistrettoScalar::from(messages[j]) * power;
-            power = power * c;
+            power *= c;
         }
 
         Ok(Self { a, b, z1, z2 })
@@ -199,7 +199,7 @@ impl BatchedConsistencyProof {
         for ct in ciphertexts {
             agg_c += ct.commitment * power;
             agg_d += ct.decryption_handle * power;
-            power = power * c;
+            power *= c;
         }
 
         // Eq 1 (handles):     a + c*agg_d == z1*pk
