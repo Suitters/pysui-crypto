@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - Unpublished
+
+### Added
+
+- Optional `auditor_public_key` on `batched_transfer_proofs`, returning `auditor_handles` and `auditor_proof`.
+
+### Fixed
+
+- Module doc in `src/ct/proofs.rs` no longer cites the removed key-consistency proof.
+
+### Changed
+
+- `batched_transfer_proofs` now returns 10 keys; both auditor keys are always present, empty when no auditor.
+
+### Removed
+
+- `register_with_auditors` and its hand-rolled `KeyConsistencyProof`, superseded by Mysten's per-transaction auditing.
+
 ## [0.2.2] - Unpublished
 
 ### Added

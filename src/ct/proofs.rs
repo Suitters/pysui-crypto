@@ -3,11 +3,10 @@
 
 //! Confidential-transfer zero-knowledge proofs.
 //!
-//! The key-consistency and batched-ElGamal consistency proofs are hand-rolled
-//! (fastcrypto's `KeyConsistencyProof` is non-serialisable with private fields,
-//! and fastcrypto exposes no batched-ElGamal API), replicating fastcrypto's exact
-//! `prove` + Fiat-Shamir `challenge` so the transcript matches the on-chain Move
-//! verifier bit-for-bit, but emitting the flat Move wire form.
+//! The batched-ElGamal consistency proof is hand-rolled (fastcrypto exposes no
+//! batched-ElGamal API), replicating fastcrypto's exact `prove` + Fiat-Shamir
+//! `challenge` so the transcript matches the on-chain Move verifier bit-for-bit,
+//! but emitting the flat Move wire form.
 //!
 //! Dependency note: this crate builds against crates.io `fastcrypto = "=0.1.11"`
 //! (see Cargo.toml) — NOT a git rev, and NOT a local clone. Verify any claim about
@@ -28,9 +27,6 @@ use fastcrypto::serde_helpers::ToFromByteArray;
 use fastcrypto::twisted_elgamal::{Ciphertext, ConsistencyProof, PublicKey};
 use rand::{thread_rng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
-
-/// Number of `u32` limbs a 32-byte private key is split into (fastcrypto `N`).
-pub const KEY_LIMB_COUNT: usize = 8;
 
 /// Owns a `Vec<Blinding>` and zeroizes each blinding's inner scalar on drop, so
 /// the secret range-proof randomness is scrubbed on every exit path — `?`
@@ -61,11 +57,6 @@ pub fn fiat_shamir_challenge(chunks: &[Vec<u8>]) -> RistrettoScalar {
     let mut digest = Blake2b256::digest(&bytes).digest;
     digest[31] = 0;
     RistrettoScalar::from_byte_array(&digest).expect("canonical scalar after zeroing top byte")
-}
-
-/// Deprecated alias for backward compatibility. Use fiat_shamir_challenge instead.
-fn fiat_shamir(chunks: &[Vec<u8>]) -> RistrettoScalar {
-    fiat_shamir_challenge(chunks)
 }
 
 /// A twisted-ElGamal consistency proof folded over `n` ciphertexts that share a
@@ -206,240 +197,6 @@ impl BatchedConsistencyProof {
         // Eq 2 (ciphertexts): b + c*agg_c == z1*G + z2*H
         self.a + agg_d * c == *encryption_key * self.z1
             && self.b + agg_c * c == g() * self.z1 + h() * self.z2
-    }
-}
-
-/// A hand-rolled key-consistency proof over `KEY_LIMB_COUNT` private-key limbs
-/// encrypted to `m` auditor recipients. Field order matches the flat Move wire:
-/// `a1(8m) || a2(8) || a3 || z1(8) || z2(8)`.
-pub struct KeyConsistencyProof {
-    a1: Vec<RistrettoPoint>,
-    a2: [RistrettoPoint; KEY_LIMB_COUNT],
-    a3: RistrettoPoint,
-    z1: [RistrettoScalar; KEY_LIMB_COUNT],
-    z2: [RistrettoScalar; KEY_LIMB_COUNT],
-}
-
-impl KeyConsistencyProof {
-    /// Prove consistency of the sender's private-key limbs across the per-limb
-    /// multi-recipient ciphertexts. Replicates fastcrypto `KeyConsistencyProof::
-    /// prove` (c6010b9): a1 is limb-major (`i*m + j`); a3 aggregates the b-limb
-    /// commitments with base `2^32`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn prove(
-        dst: &[u8],
-        sender_private_key_limbs: &[u32; KEY_LIMB_COUNT],
-        sender_public_key: &RistrettoPoint,
-        recipient_public_keys: &[RistrettoPoint],
-        commitments: &[RistrettoPoint; KEY_LIMB_COUNT],
-        decryption_handles: &[Vec<RistrettoPoint>; KEY_LIMB_COUNT],
-        blindings: &[RistrettoScalar; KEY_LIMB_COUNT],
-    ) -> Self {
-        let a: Zeroizing<[RistrettoScalar; KEY_LIMB_COUNT]> =
-            Zeroizing::new(std::array::from_fn(|_| rand_scalar()));
-        let b: Zeroizing<[RistrettoScalar; KEY_LIMB_COUNT]> =
-            Zeroizing::new(std::array::from_fn(|_| rand_scalar()));
-
-        // a1[i*m + j] = a_i * pk_j, limb-major then recipient.
-        let mut a1 = Vec::with_capacity(KEY_LIMB_COUNT * recipient_public_keys.len());
-        for ai in a.iter() {
-            for pk in recipient_public_keys {
-                a1.push(*pk * *ai);
-            }
-        }
-
-        // a2[i] = a_i * G + b_i * H.
-        let a2: [RistrettoPoint; KEY_LIMB_COUNT] = std::array::from_fn(|i| g() * a[i] + h() * b[i]);
-
-        // a3 = G * (sum_i b_i * 2^{32i}).
-        let base = RistrettoScalar::from(1u64 << 32);
-        let mut weight = RistrettoScalar::from(1u64);
-        let mut b_weighted = RistrettoScalar::zero();
-        for bi in b.iter() {
-            b_weighted += *bi * weight;
-            weight *= base;
-        }
-        let a3 = g() * b_weighted;
-        b_weighted.zeroize();
-
-        let c = Self::challenge(
-            dst,
-            sender_public_key,
-            recipient_public_keys,
-            commitments,
-            decryption_handles,
-            &a1,
-            &a2,
-            &a3,
-        );
-
-        // z1_i = a_i + c * r_i ; z2_i = b_i + c * u_i.
-        let z1: [RistrettoScalar; KEY_LIMB_COUNT] = std::array::from_fn(|i| a[i] + c * blindings[i]);
-        let z2: [RistrettoScalar; KEY_LIMB_COUNT] = std::array::from_fn(|i| {
-            b[i] + c * RistrettoScalar::from(sender_private_key_limbs[i] as u64)
-        });
-
-        Self { a1, a2, a3, z1, z2 }
-    }
-
-    /// Fiat-Shamir challenge over the exact fastcrypto absorption order:
-    /// dst, G, H, sender_pk, each recipient_pk, per limb (commitment then each
-    /// decryption handle), each a1, each a2, a3.
-    #[allow(clippy::too_many_arguments)]
-    fn challenge(
-        dst: &[u8],
-        sender_public_key: &RistrettoPoint,
-        recipient_public_keys: &[RistrettoPoint],
-        commitments: &[RistrettoPoint; KEY_LIMB_COUNT],
-        decryption_handles: &[Vec<RistrettoPoint>; KEY_LIMB_COUNT],
-        a1: &[RistrettoPoint],
-        a2: &[RistrettoPoint],
-        a3: &RistrettoPoint,
-    ) -> RistrettoScalar {
-        let mut chunks: Vec<Vec<u8>> = vec![
-            dst.to_vec(),
-            g().to_byte_array().to_vec(),
-            h().to_byte_array().to_vec(),
-            sender_public_key.to_byte_array().to_vec(),
-        ];
-        for pk in recipient_public_keys {
-            chunks.push(pk.to_byte_array().to_vec());
-        }
-        for (commitment, handles) in commitments.iter().zip(decryption_handles.iter()) {
-            chunks.push(commitment.to_byte_array().to_vec());
-            for dh in handles {
-                chunks.push(dh.to_byte_array().to_vec());
-            }
-        }
-        for p in a1 {
-            chunks.push(p.to_byte_array().to_vec());
-        }
-        for p in a2 {
-            chunks.push(p.to_byte_array().to_vec());
-        }
-        chunks.push(a3.to_byte_array().to_vec());
-        fiat_shamir(&chunks)
-    }
-
-    /// Serialise to the flat Move wire form: `a1(8m) || a2(8) || a3 || z1(8) || z2(8)`,
-    /// every point 32-byte compressed and every scalar 32-byte little-endian.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for p in &self.a1 {
-            buf.extend_from_slice(&p.to_byte_array());
-        }
-        for p in &self.a2 {
-            buf.extend_from_slice(&p.to_byte_array());
-        }
-        buf.extend_from_slice(&self.a3.to_byte_array());
-        for s in &self.z1 {
-            buf.extend_from_slice(&s.to_byte_array());
-        }
-        for s in &self.z2 {
-            buf.extend_from_slice(&s.to_byte_array());
-        }
-        buf
-    }
-}
-
-/// Raw byte components of an auditor registration, before the Python BCS layer
-/// adds outer Move framing. `key_consistency_proof` and `range_proof` are empty
-/// when there are no auditors.
-pub struct Registration {
-    pub encapsulation: Vec<u8>,
-    pub key_consistency_proof: Vec<u8>,
-    pub range_proof: Vec<u8>,
-}
-
-/// Encrypt the sender's private-key limbs to `auditor_public_keys`, proving
-/// key-consistency and per-limb 32-bit range. With no auditors, emits the
-/// empty-vec form `0x00 ‖ version(u32 LE)` and no proofs.
-///
-/// The range proof reuses each limb's twisted-ElGamal blinding. fastcrypto's
-/// Bulletproofs generators are the same G (blinding) and H (value) as the
-/// twisted-ElGamal commitment, so every bulletproof Pedersen commitment equals
-/// the corresponding TE commitment — exactly the binding the on-chain Move
-/// verifier requires. Confirmed against the reference confidential-transfers
-/// verifier.
-pub fn register_with_auditors(
-    sender_private_key: &RistrettoScalar,
-    auditor_public_keys: &[RistrettoPoint],
-    session_id: &[u8; 20],
-    version: u32,
-) -> Registration {
-    if auditor_public_keys.is_empty() {
-        let mut encapsulation = Vec::with_capacity(5);
-        encapsulation.push(0u8);
-        encapsulation.extend_from_slice(&version.to_le_bytes());
-        return Registration {
-            encapsulation,
-            key_consistency_proof: Vec::new(),
-            range_proof: Vec::new(),
-        };
-    }
-
-    // Split the private key into eight u32 limbs (little-endian). Both the raw
-    // key bytes and the derived limbs are zeroized on drop.
-    let sk_bytes = Zeroizing::new(sender_private_key.to_byte_array());
-    let limbs: Zeroizing<[u32; KEY_LIMB_COUNT]> = Zeroizing::new(std::array::from_fn(|i| {
-        u32::from_le_bytes(sk_bytes[i * 4..i * 4 + 4].try_into().unwrap())
-    }));
-    let sender_public_key = g() * *sender_private_key;
-
-    // Per-limb multi-recipient encryption: commitment_i = u_i*H + r_i*G,
-    // handle_ij = r_i * pk_j.
-    let blindings: Zeroizing<[RistrettoScalar; KEY_LIMB_COUNT]> =
-        Zeroizing::new(std::array::from_fn(|_| rand_scalar()));
-    let commitments: [RistrettoPoint; KEY_LIMB_COUNT] = std::array::from_fn(|i| {
-        h() * RistrettoScalar::from(limbs[i] as u64) + g() * blindings[i]
-    });
-    let handles: [Vec<RistrettoPoint>; KEY_LIMB_COUNT] = std::array::from_fn(|i| {
-        auditor_public_keys.iter().map(|pk| *pk * blindings[i]).collect()
-    });
-
-    // Encapsulation wire: per limb, commitment then each auditor handle.
-    let mut encapsulation = Vec::new();
-    for i in 0..KEY_LIMB_COUNT {
-        encapsulation.extend_from_slice(&commitments[i].to_byte_array());
-        for dh in &handles[i] {
-            encapsulation.extend_from_slice(&dh.to_byte_array());
-        }
-    }
-
-    // Key-consistency proof, DST = session_id ‖ 0x03 (KEY_CONSISTENCY).
-    let mut dst_kc = session_id.to_vec();
-    dst_kc.push(0x03);
-    let key_consistency_proof = KeyConsistencyProof::prove(
-        &dst_kc,
-        &limbs,
-        &sender_public_key,
-        auditor_public_keys,
-        &commitments,
-        &handles,
-        &blindings,
-    )
-    .to_bytes();
-
-    // Aggregated 32-bit range proof over the eight key limbs,
-    // DST = session_id ‖ 0x05 (RANGE_PROOF_32).
-    let mut dst_rp = session_id.to_vec();
-    dst_rp.push(0x05);
-    let values: Zeroizing<Vec<u64>> = Zeroizing::new(limbs.iter().map(|&l| l as u64).collect());
-    let range_blindings = ScrubbedBlindings(blindings.iter().map(|r| Blinding(*r)).collect());
-    let range_proof = RangeProof::prove_batch(
-        &values,
-        &range_blindings.0,
-        &Range::Bits32,
-        &dst_rp,
-        &mut thread_rng(),
-    )
-    .expect("range proof over in-range u32 limbs")
-    .to_bytes();
-
-    Registration {
-        encapsulation,
-        key_consistency_proof,
-        range_proof,
     }
 }
 
@@ -768,6 +525,95 @@ pub fn unwrap_proofs(
     })
 }
 
+/// Number of `u32` limbs an auditor sees per receiver amount. A `u64` amount's
+/// four 16-bit limbs fold pairwise into two 32-bit limbs (Move `U32_LIMBS`).
+const AUDITOR_U32_LIMBS: usize = 2;
+
+/// Per-transfer auditor package: each receiver's `[lo, hi]` u32-limb decryption
+/// handles under the auditor key, plus ONE ElGamal-consistency proof folded over
+/// every auditor ciphertext in the batch.
+///
+/// Mirrors Move `auditors::AuditorPackage` (confidential-transfers `c2f842c`).
+/// Auditing is single-auditor by construction on chain: `auditors::verify_under`
+/// returns false unless the key vector holds exactly one key, and rotation is
+/// handled by re-verifying under `previous_pks` — never by folding several keys
+/// into one proof. That is why a single shared `auditor_public_key` suffices, and
+/// why this reuses [`BatchedConsistencyProof`] unchanged.
+pub struct AuditorPackage {
+    /// One 64-byte `lo ‖ hi` handle pair per receiver, in receiver order.
+    pub handles: Vec<[u8; 64]>,
+    /// The folded 128-byte ElGamal proof over all `2N` auditor ciphertexts.
+    pub proof: [u8; 128],
+}
+
+/// Build the auditor package over `receivers`, each a `(amount, four 16-bit limb
+/// blindings)` pair in submission order.
+///
+/// The sender's own new balance is deliberately excluded: Move's `auditors::verify`
+/// asserts `handles.length() == receiver_coins.length()`.
+///
+/// For receiver `r` and u32 limb `l`, Move derives the shared commitment
+/// homomorphically from the range-proven u16 limbs as `Ǎ_l = C_{2l} + 2^16·C_{2l+1}`
+/// (`encrypted_amount::ciphertexts_u32`). Since `C_i = H·m_i + G·r_i`, that fold is
+/// exactly `H·m̌_l + G·ř_l` for `m̌_l = m_{2l} + 2^16·m_{2l+1}` and
+/// `ř_l = r_{2l} + 2^16·r_{2l+1}`. So re-encrypting `m̌_l` under `ř_l` reproduces the
+/// on-chain commitment bit-for-bit AND yields the auditor handle
+/// `D_{r,l} = pk_auditor·ř_l` in one step. `m̌_l` spans exactly 32 bits, so the `u32`
+/// argument is lossless.
+///
+/// Transcript order is receiver-major — `[r0l0, r0l1, r1l0, r1l1, …]` — matching
+/// `auditors::build_auditor_encryptions`. That order is bound into the Fiat-Shamir
+/// challenge, so it must not drift from the Move side.
+fn auditor_package(
+    auditor_public_key: &RistrettoPoint,
+    receivers: &[(u64, Zeroizing<[RistrettoScalar; 4]>)],
+    dst_auditor: &[u8],
+) -> FastCryptoResult<AuditorPackage> {
+    let two_16 = RistrettoScalar::from(1u64 << 16);
+    let width = AUDITOR_U32_LIMBS * receivers.len();
+
+    let mut ciphertexts: Vec<cipher::Ciphertext> = Vec::with_capacity(width);
+    let mut messages: Vec<u64> = Vec::with_capacity(width);
+    let mut blindings: Zeroizing<Vec<RistrettoScalar>> =
+        Zeroizing::new(Vec::with_capacity(width));
+    let mut handles: Vec<[u8; 64]> = Vec::with_capacity(receivers.len());
+
+    for (amount, limb_blindings) in receivers {
+        let mut pair = [0u8; 64];
+        for l in 0..AUDITOR_U32_LIMBS {
+            let lo = (*amount >> (32 * l)) & 0xFFFF;
+            let hi = (*amount >> (32 * l + 16)) & 0xFFFF;
+            let message = lo | (hi << 16);
+            let blinding = limb_blindings[2 * l] + limb_blindings[2 * l + 1] * two_16;
+
+            let ct = cipher::Ciphertext::encrypt_with_blinding(
+                auditor_public_key,
+                message as u32,
+                &blinding,
+            );
+            pair[l * 32..(l + 1) * 32].copy_from_slice(&ct.decryption_handle.to_byte_array());
+
+            ciphertexts.push(ct);
+            messages.push(message);
+            blindings.push(blinding);
+        }
+        handles.push(pair);
+    }
+
+    let proof_bytes = BatchedConsistencyProof::prove(
+        dst_auditor,
+        auditor_public_key,
+        &ciphertexts,
+        &messages,
+        &blindings[..],
+    )?
+    .to_bytes();
+    let mut proof = [0u8; 128];
+    proof.copy_from_slice(&proof_bytes);
+
+    Ok(AuditorPackage { handles, proof })
+}
+
 /// Raw byte components of a batched confidential transfer: encrypted receiver amounts,
 /// new balance, range proofs for all limbs, per-limb consistency proofs,
 /// sender total consistency proof, balance proof, and seed material.
@@ -781,6 +627,11 @@ pub struct BatchedTransferProofs {
     pub balance_proof: Vec<u8>,
     pub total_sender_handle: [u8; 32],
     pub seed_point: [u8; 32],
+    /// One 64-byte `lo ‖ hi` auditor handle pair per receiver; empty when the
+    /// transfer carries no auditor.
+    pub auditor_handles: Vec<[u8; 64]>,
+    /// The folded 128-byte auditor ElGamal proof; empty when there is no auditor.
+    pub auditor_proof: Vec<u8>,
 }
 
 /// Construct a batched transfer: encrypt amounts to N receivers and form zero-knowledge
@@ -794,6 +645,9 @@ pub struct BatchedTransferProofs {
 /// * `recipients` — slice of (public_key, amount) pairs; 1 <= N <= 255
 /// * `new_balance` — sender's balance after the transfer
 /// * `session_id` — 20-byte session identifier
+/// * `auditor_public_key` — optional auditor key. `Some` attaches a per-transfer
+///   auditor package (handles + one folded proof) covering the receivers only;
+///   `None` leaves both auditor fields empty.
 ///
 /// # Returns
 /// A `BatchedTransferProofs` struct with all components needed for on-chain verification.
@@ -805,6 +659,7 @@ pub fn batched_transfer_proofs(
     recipients: &[(RistrettoPoint, u64)],
     new_balance: u64,
     session_id: &[u8; 20],
+    auditor_public_key: Option<&RistrettoPoint>,
 ) -> FastCryptoResult<BatchedTransferProofs> {
     let n = recipients.len();
     if !(1..=255).contains(&n) {
@@ -848,6 +703,20 @@ pub fn batched_transfer_proofs(
 
     // Step 5: Append new balance to amounts in order
     amounts_in_order.push((new_balance, nb_blindings));
+
+    // Per-transfer auditor package over the RECEIVERS ONLY — Move's
+    // `auditors::verify` asserts `handles.length() == receiver_coins.length()`, so
+    // the sender's own new balance (appended just above) is excluded by slicing to
+    // `n`. DST = session_id ‖ 0x07 (AUDITOR_ELGAMAL).
+    let (auditor_handles, auditor_proof) = match auditor_public_key {
+        Some(auditor_pk) => {
+            let mut dst_auditor = session_id.to_vec();
+            dst_auditor.push(0x07);
+            let package = auditor_package(auditor_pk, &amounts_in_order[..n], &dst_auditor)?;
+            (package.handles, package.proof.to_vec())
+        }
+        None => (Vec::new(), Vec::new()),
+    };
 
     // Step 6: Prepare consistency_proofs return vector
     let consistency_proofs: Vec<[u8; 128]> = consistency_proofs_vec
@@ -993,6 +862,8 @@ pub fn batched_transfer_proofs(
         balance_proof,
         total_sender_handle,
         seed_point: seed_point.to_byte_array(),
+        auditor_handles,
+        auditor_proof,
     })
 }
 
@@ -1019,7 +890,7 @@ mod tests {
 
         let mut dst_ddh = session_id.to_vec();
         dst_ddh.push(0x01);
-        let c = fiat_shamir(&[
+        let c = fiat_shamir_challenge(&[
             dst_ddh,
             bcs::to_bytes(&g()).unwrap(),
             bcs::to_bytes(&commitment).unwrap(),
@@ -1065,143 +936,6 @@ mod tests {
             "consistency proof must be one folded 128-byte proof"
         );
         assert!(!enc.range_proof.is_empty());
-    }
-
-    #[test]
-    fn registration_component_lengths_match_layout() {
-        let session_id = [0x07u8; 20];
-        let sk = super::rand_scalar();
-        let auditors: Vec<RistrettoPoint> =
-            (0..3).map(|_| public_key(&super::rand_scalar())).collect();
-        let m = auditors.len();
-        let reg = register_with_auditors(&sk, &auditors, &session_id, 1);
-        // encapsulation: 8 limbs, each commitment(32) + m handles(32).
-        assert_eq!(reg.encapsulation.len(), KEY_LIMB_COUNT * 32 * (1 + m));
-        // key-consistency proof: a1(8m) + a2(8) + a3(1) + z1(8) + z2(8), 32 each.
-        assert_eq!(
-            reg.key_consistency_proof.len(),
-            32 * (KEY_LIMB_COUNT * m + KEY_LIMB_COUNT + 1 + KEY_LIMB_COUNT + KEY_LIMB_COUNT)
-        );
-        assert!(!reg.range_proof.is_empty());
-    }
-
-    #[test]
-    fn registration_empty_auditors_emits_version() {
-        let session_id = [0x07u8; 20];
-        let sk = super::rand_scalar();
-        let reg = register_with_auditors(&sk, &[], &session_id, 0x04030201);
-        let mut expected = vec![0u8];
-        expected.extend_from_slice(&0x04030201u32.to_le_bytes());
-        assert_eq!(reg.encapsulation, expected);
-        assert!(reg.key_consistency_proof.is_empty());
-        assert!(reg.range_proof.is_empty());
-    }
-
-    /// Split a private-key scalar's 32-byte LE encoding into eight u32 limbs.
-    fn key_limbs(sk: &RistrettoScalar) -> [u32; KEY_LIMB_COUNT] {
-        let bytes = sk.to_byte_array();
-        std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
-    }
-
-    #[test]
-    #[allow(clippy::needless_range_loop)]
-    fn key_consistency_proof_satisfies_sigma_equations() {
-        let dst = [0x03u8; 21];
-        // Sender key and its limb decomposition.
-        let sk = super::rand_scalar();
-        let sender_pk = public_key(&sk);
-        let limbs = key_limbs(&sk);
-
-        // Two auditor recipients.
-        let recipients: Vec<RistrettoPoint> =
-            (0..2).map(|_| public_key(&super::rand_scalar())).collect();
-        let m = recipients.len();
-
-        // Per-limb multi-recipient ciphertexts: commitment_i = u_i*H + r_i*G,
-        // handle_ij = r_i * pk_j.
-        let blindings: [RistrettoScalar; KEY_LIMB_COUNT] =
-            std::array::from_fn(|_| super::rand_scalar());
-        let commitments: [RistrettoPoint; KEY_LIMB_COUNT] = std::array::from_fn(|i| {
-            h() * RistrettoScalar::from(limbs[i] as u64) + g() * blindings[i]
-        });
-        let handles: [Vec<RistrettoPoint>; KEY_LIMB_COUNT] = std::array::from_fn(|i| {
-            recipients.iter().map(|pk| *pk * blindings[i]).collect()
-        });
-
-        let proof = KeyConsistencyProof::prove(
-            &dst,
-            &limbs,
-            &sender_pk,
-            &recipients,
-            &commitments,
-            &handles,
-            &blindings,
-        );
-
-        // Recompute the challenge from the public transcript.
-        let c = KeyConsistencyProof::challenge(
-            &dst,
-            &sender_pk,
-            &recipients,
-            &commitments,
-            &handles,
-            &proof.a1,
-            &proof.a2,
-            &proof.a3,
-        );
-
-        // Eq.1: z1_i * pk_j == a1[i*m+j] + c * handle_ij.
-        for i in 0..KEY_LIMB_COUNT {
-            for (j, pk) in recipients.iter().enumerate() {
-                let lhs = *pk * proof.z1[i];
-                let rhs = proof.a1[i * m + j] + handles[i][j] * c;
-                assert_eq!(lhs.to_byte_array(), rhs.to_byte_array(), "eq1 i={i} j={j}");
-            }
-        }
-
-        // Eq.2: G*z1_i + H*z2_i == a2_i + c * commitment_i.
-        for i in 0..KEY_LIMB_COUNT {
-            let lhs = g() * proof.z1[i] + h() * proof.z2[i];
-            let rhs = proof.a2[i] + commitments[i] * c;
-            assert_eq!(lhs.to_byte_array(), rhs.to_byte_array(), "eq2 i={i}");
-        }
-
-        // Eq.3: G * (sum_i 2^{32i} z2_i) == a3 + c * sender_pk.
-        let base = RistrettoScalar::from(1u64 << 32);
-        let mut weight = RistrettoScalar::from(1u64);
-        let mut z2_weighted = RistrettoScalar::zero();
-        for i in 0..KEY_LIMB_COUNT {
-            z2_weighted += proof.z2[i] * weight;
-            weight *= base;
-        }
-        let lhs = g() * z2_weighted;
-        let rhs = proof.a3 + sender_pk * c;
-        assert_eq!(lhs.to_byte_array(), rhs.to_byte_array(), "eq3");
-    }
-
-    #[test]
-    fn proof_wire_length_matches_layout() {
-        let dst = [0x03u8; 21];
-        let sk = super::rand_scalar();
-        let sender_pk = public_key(&sk);
-        let limbs = key_limbs(&sk);
-        let recipients: Vec<RistrettoPoint> =
-            (0..3).map(|_| public_key(&super::rand_scalar())).collect();
-        let m = recipients.len();
-        let blindings: [RistrettoScalar; KEY_LIMB_COUNT] =
-            std::array::from_fn(|_| super::rand_scalar());
-        let commitments: [RistrettoPoint; KEY_LIMB_COUNT] = std::array::from_fn(|i| {
-            h() * RistrettoScalar::from(limbs[i] as u64) + g() * blindings[i]
-        });
-        let handles: [Vec<RistrettoPoint>; KEY_LIMB_COUNT] = std::array::from_fn(|i| {
-            recipients.iter().map(|pk| *pk * blindings[i]).collect()
-        });
-        let proof = KeyConsistencyProof::prove(
-            &dst, &limbs, &sender_pk, &recipients, &commitments, &handles, &blindings,
-        );
-        // a1(8m) + a2(8) + a3(1) + z1(8) + z2(8) elements, 32 bytes each.
-        let expected = (KEY_LIMB_COUNT * m + KEY_LIMB_COUNT + 1 + KEY_LIMB_COUNT + KEY_LIMB_COUNT) * 32;
-        assert_eq!(proof.to_bytes().len(), expected);
     }
 
     /// Pin our ElGamal Fiat-Shamir transcript against the REFERENCE Move
@@ -1400,6 +1134,7 @@ mod tests {
                 &recipients,
                 new_balance,
                 &session_id,
+                None,
             )
             .expect("batched_transfer_proofs case A");
 
@@ -1443,6 +1178,7 @@ mod tests {
                 &recipients,
                 new_balance,
                 &session_id,
+                None,
             )
             .expect("batched_transfer_proofs case B");
 
@@ -1683,5 +1419,141 @@ mod tests {
                 "{label}: SEED tie r{i} l{l}: handle must equal recipient_pk * recovered_blinding"
             );
         }
+    }
+
+    /// The auditor package must verify against ciphertexts rebuilt THE WAY MOVE
+    /// BUILDS THEM, not the way we built them. `auditors::build_auditor_encryptions`
+    /// pairs each receiver's u32 commitment — folded homomorphically out of the
+    /// range-proven u16 limbs by `encrypted_amount::ciphertexts_u32` as
+    /// `Ǎ_l = C_{2l} + 2^16·C_{2l+1}` — with the sender-supplied handle.
+    ///
+    /// We instead derive each pair in ONE step by re-encrypting `m̌_l` under `ř_l`.
+    /// The two routes agree only if `ř_l = r_{2l} + 2^16·r_{2l+1}` really is the
+    /// blinding of the folded commitment. Verifying against ciphertexts folded
+    /// FROM THE WIRE is what proves that; a round-trip against our own inputs would
+    /// pass even if the derivation were wrong.
+    #[test]
+    fn auditor_package_verifies_against_move_style_folded_ciphertexts() {
+        let sender_sk = RistrettoScalar::from(0x00A1_1CE0u64);
+        let sender_pk = g() * sender_sk;
+        let auditor_sk = RistrettoScalar::from(0x00AD_1704u64);
+        let auditor_pk = g() * auditor_sk;
+
+        // Every 16-bit limb distinct: a fold that dropped, swapped, or mis-weighted
+        // a limb would still pass if the limbs happened to be equal.
+        let recipients: Vec<(RistrettoPoint, u64)> = vec![
+            (g() * RistrettoScalar::from(11u64), 0x0001_0002_0003_0004u64),
+            (g() * RistrettoScalar::from(22u64), 0x000A_000B_000C_000Du64),
+            (g() * RistrettoScalar::from(33u64), 0x0011_0022_0033_0044u64),
+        ];
+        let n = recipients.len();
+
+        let starting_balance: u64 = 0x7000_0000_0000_0000;
+        let total_sent: u64 = recipients.iter().map(|(_, a)| a).sum();
+        let new_balance = starting_balance - total_sent;
+        let session_id = [0x5Au8; 20];
+        let old_active_balance = build_old_balance(&sender_pk, starting_balance, &session_id);
+
+        let proofs = batched_transfer_proofs(
+            &sender_sk,
+            &sender_pk,
+            &old_active_balance,
+            &recipients,
+            new_balance,
+            &session_id,
+            Some(&auditor_pk),
+        )
+        .expect("batched_transfer_proofs with auditor");
+
+        // One 64-byte [lo ‖ hi] pair per RECEIVER (never the sender's new balance),
+        // and ONE folded 128-byte proof over all 2N ciphertexts.
+        assert_eq!(proofs.auditor_handles.len(), n, "one handle pair per receiver");
+        assert_eq!(proofs.auditor_proof.len(), 128, "exactly one folded proof");
+
+        // Rebuild the auditor ciphertexts the Move way: fold the u16 limb
+        // commitments straight off the wire, then pair with our emitted handles.
+        let two_16 = RistrettoScalar::from(1u64 << 16);
+        let point_at = |buf: &[u8], off: usize| {
+            RistrettoPoint::from_byte_array(&buf[off..off + 32].try_into().unwrap()).unwrap()
+        };
+        let mut folded_cts: Vec<cipher::Ciphertext> = Vec::with_capacity(2 * n);
+        for r in 0..n {
+            let wire = &proofs.encrypted_amounts[r][..];
+            for l in 0..AUDITOR_U32_LIMBS {
+                // Each limb ciphertext on the wire is commitment(32) ‖ handle(32).
+                let c_lo = point_at(wire, (2 * l) * 64);
+                let c_hi = point_at(wire, (2 * l + 1) * 64);
+                folded_cts.push(cipher::Ciphertext {
+                    commitment: c_lo + c_hi * two_16,
+                    decryption_handle: point_at(&proofs.auditor_handles[r][..], l * 32),
+                });
+            }
+        }
+
+        let mut dst_auditor = session_id.to_vec();
+        dst_auditor.push(0x07);
+        let proof = BatchedConsistencyProof::from_bytes(&proofs.auditor_proof)
+            .expect("auditor proof parses from wire bytes");
+        assert!(
+            proof.verify(&dst_auditor, &auditor_pk, &folded_cts),
+            "auditor proof must verify against Move-style folded ciphertexts"
+        );
+
+        let rebuild = |src: &[cipher::Ciphertext]| -> Vec<cipher::Ciphertext> {
+            src.iter()
+                .map(|c| cipher::Ciphertext {
+                    commitment: c.commitment,
+                    decryption_handle: c.decryption_handle,
+                })
+                .collect()
+        };
+
+        // Batch order is bound into the transcript.
+        let mut swapped = rebuild(&folded_cts);
+        swapped.swap(0, 1);
+        assert!(
+            !proof.verify(&dst_auditor, &auditor_pk, &swapped),
+            "auditor proof must not verify against a reordered batch"
+        );
+
+        // The DST binds the proof to the auditor protocol tag (0x07), not ELGAMAL (0x02).
+        let mut wrong_dst = session_id.to_vec();
+        wrong_dst.push(0x02);
+        assert!(
+            !proof.verify(&wrong_dst, &auditor_pk, &folded_cts),
+            "auditor proof must not verify under the ELGAMAL DST"
+        );
+
+        // The proof is bound to the auditor key.
+        let other_pk = g() * RistrettoScalar::from(0x00DE_AD00u64);
+        assert!(
+            !proof.verify(&dst_auditor, &other_pk, &folded_cts),
+            "auditor proof must not verify under a different auditor key"
+        );
+    }
+
+    /// With no auditor the package is the explicit empty form — never absent.
+    #[test]
+    fn no_auditor_yields_empty_package() {
+        let sender_sk = RistrettoScalar::from(0x00B0_B0B0u64);
+        let sender_pk = g() * sender_sk;
+        let recipients: Vec<(RistrettoPoint, u64)> =
+            vec![(g() * RistrettoScalar::from(7u64), 250u64)];
+        let session_id = [0x11u8; 20];
+        let old_active_balance = build_old_balance(&sender_pk, 1000, &session_id);
+
+        let proofs = batched_transfer_proofs(
+            &sender_sk,
+            &sender_pk,
+            &old_active_balance,
+            &recipients,
+            750,
+            &session_id,
+            None,
+        )
+        .expect("batched_transfer_proofs without auditor");
+
+        assert!(proofs.auditor_handles.is_empty(), "no auditor -> no handles");
+        assert!(proofs.auditor_proof.is_empty(), "no auditor -> no proof");
     }
 }

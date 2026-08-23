@@ -140,38 +140,6 @@ fn encrypt_amount_with_proofs<'py>(
     Ok(dict)
 }
 
-/// Register the sender's private key with zero or more `auditor_public_keys`.
-///
-/// Returns `{"encapsulation": bytes, "key_consistency_proof": bytes,
-/// "range_proof": bytes}`. With no auditors the encapsulation is the empty-vec
-/// form `0x00 ‖ version(u32 LE)` and both proofs are empty. The Python BCS layer
-/// adds the outer Move framing.
-#[pyfunction]
-fn register_with_auditors<'py>(
-    py: Python<'py>,
-    private_key: &[u8],
-    auditor_public_keys: Vec<Vec<u8>>,
-    session_id: &[u8],
-    version: u32,
-) -> PyResult<Bound<'py, PyDict>> {
-    let sk = private_key_from_bytes(private_key)?;
-    let auditors: Vec<RistrettoPoint> = auditor_public_keys
-        .iter()
-        .enumerate()
-        .map(|(i, pk)| point_from_bytes(pk, &format!("auditor_public_keys[{i}]")))
-        .collect::<PyResult<_>>()?;
-    let session = session_id_from_bytes(session_id)?;
-    let reg = proofs::register_with_auditors(&sk, &auditors, &session, version);
-    let dict = PyDict::new(py);
-    dict.set_item("encapsulation", PyBytes::new(py, &reg.encapsulation))?;
-    dict.set_item(
-        "key_consistency_proof",
-        PyBytes::new(py, &reg.key_consistency_proof),
-    )?;
-    dict.set_item("range_proof", PyBytes::new(py, &reg.range_proof))?;
-    Ok(dict)
-}
-
 /// DDH "prove-is-zero" proof for the confidential unwrap / withdraw path.
 ///
 /// Proves the residual ciphertext `(commitment, decryption_handle)` encrypts
@@ -277,10 +245,27 @@ fn unwrap_proofs<'py>(
 /// Returns `{"encrypted_amounts": list[bytes], "new_balance_amount": bytes(256),
 /// "range_proofs": list[bytes], "consistency_proofs": list[bytes(128)],
 /// "sender_total_consistency_proof": bytes, "balance_proof": bytes(96),
-/// "total_sender_handle": bytes(32), "seed_point": bytes(32)}`. Each entry in
+/// "total_sender_handle": bytes(32), "seed_point": bytes(32),
+/// "auditor_handles": list[bytes(64)], "auditor_proof": bytes}`. Each entry in
 /// `consistency_proofs` is ONE proof folded over all four limbs, not four per-limb
 /// proofs concatenated.
+///
+/// `auditor_public_key` is optional. Omitted, `auditor_handles` is an empty list
+/// and `auditor_proof` is empty bytes — the explicit empty form, never `None`.
+/// Supplied, `auditor_handles` holds one 64-byte `lo ‖ hi` u32-limb handle pair
+/// per recipient (recipients only, never the sender's new balance) and
+/// `auditor_proof` is ONE 128-byte ElGamal proof folded over all of them.
 #[pyfunction]
+#[pyo3(signature = (
+    sender_private_key,
+    sender_public_key,
+    old_active_balance,
+    recipients,
+    new_balance,
+    session_id,
+    auditor_public_key = None,
+))]
+#[allow(clippy::too_many_arguments)]
 fn batched_transfer_proofs<'py>(
     py: Python<'py>,
     sender_private_key: &[u8],
@@ -289,6 +274,7 @@ fn batched_transfer_proofs<'py>(
     recipients: Vec<(Vec<u8>, u64)>,
     new_balance: u64,
     session_id: &[u8],
+    auditor_public_key: Option<&[u8]>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let sk = private_key_from_bytes(sender_private_key)?;
     let pk = point_from_bytes(sender_public_key, "sender_public_key")?;
@@ -318,8 +304,20 @@ fn batched_transfer_proofs<'py>(
         .collect();
     let parsed_recipients = parsed_recipients?;
 
-    let result = proofs::batched_transfer_proofs(&sk, &pk, &old_balance, &parsed_recipients, new_balance, &session)
-        .map_err(ct_value_error)?;
+    let auditor_pk = auditor_public_key
+        .map(|bytes| point_from_bytes(bytes, "auditor_public_key"))
+        .transpose()?;
+
+    let result = proofs::batched_transfer_proofs(
+        &sk,
+        &pk,
+        &old_balance,
+        &parsed_recipients,
+        new_balance,
+        &session,
+        auditor_pk.as_ref(),
+    )
+    .map_err(ct_value_error)?;
 
     let dict = PyDict::new(py);
 
@@ -358,6 +356,15 @@ fn batched_transfer_proofs<'py>(
 
     // seed_point: [u8; 32] -> bytes
     dict.set_item("seed_point", PyBytes::new(py, &result.seed_point))?;
+
+    // auditor_handles: Vec<[u8; 64]> -> list[bytes]; empty when no auditor.
+    dict.set_item("auditor_handles", PyList::new(py, result.auditor_handles
+        .iter()
+        .map(|ba| PyBytes::new(py, ba))
+        .collect::<Vec<_>>())?)?;
+
+    // auditor_proof: Vec<u8> -> bytes; empty when no auditor.
+    dict.set_item("auditor_proof", PyBytes::new(py, &result.auditor_proof))?;
 
     // sk (Zeroizing<RistrettoScalar>) is dropped here, zeroizing the scalar
     Ok(dict)
@@ -477,7 +484,6 @@ pub fn register_ct(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decrypt_balance, m)?)?;
     m.add_function(wrap_pyfunction!(subtract_encrypted, m)?)?;
     m.add_function(wrap_pyfunction!(encrypt_amount_with_proofs, m)?)?;
-    m.add_function(wrap_pyfunction!(register_with_auditors, m)?)?;
     m.add_function(wrap_pyfunction!(unwrap_proof, m)?)?;
     m.add_function(wrap_pyfunction!(unwrap_proofs, m)?)?;
     m.add_function(wrap_pyfunction!(batched_transfer_proofs, m)?)?;

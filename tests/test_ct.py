@@ -7,8 +7,6 @@ import pytest
 
 import pysui_crypto as pc
 
-# Number of u32 limbs a 32-byte private key is split into (Rust KEY_LIMB_COUNT).
-KEY_LIMB_COUNT = 8
 SESSION_ID = bytes([7] * 20)
 
 
@@ -78,47 +76,6 @@ class TestEncryptAmountWithProofs:
             pc.encrypt_amount_with_proofs(pk, 1, bytes(19))
 
 
-class TestRegisterWithAuditors:
-    def test_no_auditors_emits_version_only(self) -> None:
-        sk = _keypair()["private_key"]
-        result = pc.register_with_auditors(sk, [], SESSION_ID, 0x04030201)
-        assert result["encapsulation"] == b"\x00" + (0x04030201).to_bytes(4, "little")
-        assert result["key_consistency_proof"] == b""
-        assert result["range_proof"] == b""
-
-    @pytest.mark.parametrize("m", [1, 3])
-    def test_with_auditors_component_lengths(self, m: int) -> None:
-        sk = _keypair()["private_key"]
-        auditors = [_keypair()["public_key"] for _ in range(m)]
-        result = pc.register_with_auditors(sk, auditors, SESSION_ID, 1)
-        # encapsulation: 8 limbs, each commitment(32) + m handles(32).
-        assert len(result["encapsulation"]) == KEY_LIMB_COUNT * 32 * (1 + m)
-        # key-consistency: a1(8m) + a2(8) + a3(1) + z1(8) + z2(8), 32 each.
-        expected_kc = 32 * (
-            KEY_LIMB_COUNT * m
-            + KEY_LIMB_COUNT
-            + 1
-            + KEY_LIMB_COUNT
-            + KEY_LIMB_COUNT
-        )
-        assert len(result["key_consistency_proof"]) == expected_kc
-        assert len(result["range_proof"]) > 0
-
-    def test_bad_private_key_length_raises(self) -> None:
-        with pytest.raises(ValueError):
-            pc.register_with_auditors(bytes(31), [], SESSION_ID, 0)
-
-    def test_bad_auditor_length_raises(self) -> None:
-        sk = _keypair()["private_key"]
-        with pytest.raises(ValueError):
-            pc.register_with_auditors(sk, [bytes(31)], SESSION_ID, 0)
-
-    def test_bad_session_id_length_raises(self) -> None:
-        sk = _keypair()["private_key"]
-        with pytest.raises(ValueError):
-            pc.register_with_auditors(sk, [], bytes(19), 0)
-
-
 class TestUnwrapProof:
     def test_returns_96_byte_proof(self) -> None:
         sender = _keypair()
@@ -169,7 +126,7 @@ class TestEncryptDecryptInterop:
 
 class TestBatchedTransferProofs:
     def test_returns_named_dict_with_all_keys(self) -> None:
-        """Test that batched_transfer_proofs returns a dict with all 8 required keys."""
+        """Test that batched_transfer_proofs returns a dict with all 10 required keys."""
         sender = _keypair()
         recipient1 = _keypair()
         recipient2 = _keypair()
@@ -197,7 +154,7 @@ class TestBatchedTransferProofs:
             SESSION_ID,
         )
 
-        # Check all 8 keys are present
+        # Check all 10 keys are present
         expected_keys = {
             "encrypted_amounts",
             "new_balance_amount",
@@ -207,6 +164,8 @@ class TestBatchedTransferProofs:
             "balance_proof",
             "total_sender_handle",
             "seed_point",
+            "auditor_handles",
+            "auditor_proof",
         }
         assert set(result.keys()) == expected_keys
 
@@ -671,3 +630,74 @@ class TestSenderTransferRecovery:
         )
         with pytest.raises(ValueError):
             pc.decrypt_transfer_amount(tr, 0, b"\x00" * 100)
+
+
+class TestAuditorPackage:
+    """Per-transfer auditor package (Move ``auditors::AuditorPackage``).
+
+    Auditing is single-auditor by construction on chain — ``auditors::verify_under``
+    rejects any key vector whose length is not exactly one — so a single optional
+    ``auditor_public_key`` covers the whole transfer.
+    """
+
+    @staticmethod
+    def _transfer(
+        auditor_public_key: bytes | None, recipient_count: int = 2
+    ) -> dict:
+        sender = _keypair()
+        starting_balance = 10000
+        encrypted = pc.encrypt_amount_with_proofs(
+            sender["public_key"], starting_balance, SESSION_ID
+        )
+        recipients = [
+            (_keypair()["public_key"], 100 * (i + 1))
+            for i in range(recipient_count)
+        ]
+        total = sum(amount for _pk, amount in recipients)
+        return pc.batched_transfer_proofs(
+            sender["private_key"],
+            sender["public_key"],
+            encrypted["encrypted_amount"],
+            recipients,
+            starting_balance - total,
+            SESSION_ID,
+            auditor_public_key,
+        )
+
+    def test_omitted_auditor_yields_explicit_empty_form(self) -> None:
+        # Parameter omitted entirely, exercising the PyO3 default.
+        sender = _keypair()
+        encrypted = pc.encrypt_amount_with_proofs(
+            sender["public_key"], 1000, SESSION_ID
+        )
+        result = pc.batched_transfer_proofs(
+            sender["private_key"],
+            sender["public_key"],
+            encrypted["encrypted_amount"],
+            [(_keypair()["public_key"], 250)],
+            750,
+            SESSION_ID,
+        )
+        # Explicit empty structures, never None — both keys are always present.
+        assert result["auditor_handles"] == []
+        assert result["auditor_proof"] == b""
+
+    def test_explicit_none_matches_omitted(self) -> None:
+        result = self._transfer(None)
+        assert result["auditor_handles"] == []
+        assert result["auditor_proof"] == b""
+
+    @pytest.mark.parametrize("recipient_count", [1, 2, 5])
+    def test_one_handle_pair_per_recipient(self, recipient_count: int) -> None:
+        auditor = _keypair()
+        result = self._transfer(auditor["public_key"], recipient_count)
+        # One 64-byte [lo || hi] u32-limb pair per RECIPIENT. The sender's own new
+        # balance is never audited, so this must not be recipient_count + 1.
+        assert len(result["auditor_handles"]) == recipient_count
+        assert all(len(pair) == 64 for pair in result["auditor_handles"])
+        # ONE folded proof over all 2N auditor ciphertexts, whatever the batch size.
+        assert len(result["auditor_proof"]) == 128
+
+    def test_bad_auditor_key_length_raises(self) -> None:
+        with pytest.raises(ValueError):
+            self._transfer(bytes(31))

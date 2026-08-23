@@ -98,13 +98,6 @@ def encrypt_amount_with_proofs(
     recipient_public_key: bytes, amount: int, session_id: bytes
 ) -> dict[str, bytes]: ...
 
-def register_with_auditors(
-    private_key: bytes,
-    auditor_public_keys: list[bytes],
-    session_id: bytes,
-    version: int,
-) -> dict[str, bytes]: ...
-
 def unwrap_proof(
     sender_private_key: bytes,
     sender_public_key: bytes,
@@ -124,7 +117,14 @@ class UnwrapProofs(TypedDict):
 
 class BatchedTransferProofs(TypedDict):
     """Return shape of :func:`batched_transfer_proofs`: per-recipient encrypted
-    amounts and the zero-knowledge proofs for a batched confidential transfer."""
+    amounts and the zero-knowledge proofs for a batched confidential transfer.
+
+    ``auditor_handles`` and ``auditor_proof`` carry the per-transfer auditor
+    package. Both are always present: when no ``auditor_public_key`` was supplied
+    they are an empty list and empty bytes respectively, never ``None``. When one
+    was supplied, ``auditor_handles`` holds one 64-byte ``lo || hi`` u32-limb
+    handle pair per recipient (recipients only, never the sender's new balance)
+    and ``auditor_proof`` is ONE 128-byte ElGamal proof folded over all of them."""
 
     encrypted_amounts: list[bytes]
     new_balance_amount: bytes
@@ -134,6 +134,8 @@ class BatchedTransferProofs(TypedDict):
     balance_proof: bytes
     total_sender_handle: bytes
     seed_point: bytes
+    auditor_handles: list[bytes]
+    auditor_proof: bytes
 
 class RekeyProofs(TypedDict):
     """Return shape of :func:`rekey_proofs`: the rotated decryption handles and
@@ -158,6 +160,7 @@ def batched_transfer_proofs(
     recipients: list[tuple[bytes, int]],
     new_balance: int,
     session_id: bytes,
+    auditor_public_key: bytes | None = None,
 ) -> BatchedTransferProofs: ...
 
 def rekey_proofs(
