@@ -24,7 +24,7 @@ use fastcrypto::groups::GroupElement;
 use fastcrypto::hash::{Blake2b256, HashFunction};
 use fastcrypto::pedersen::Blinding;
 use fastcrypto::serde_helpers::ToFromByteArray;
-use fastcrypto::twisted_elgamal::{Ciphertext, ConsistencyProof, PublicKey};
+use fastcrypto::twisted_elgamal::Ciphertext;
 use rand::{thread_rng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -236,7 +236,7 @@ pub fn encrypt_amount_with_proofs(
         rand_scalar(),
         rand_scalar(),
     ]);
-    let prepared = prepare_amount(recipient_public_key, amount, &blindings, &dst_cons)?;
+    let prepared = prepare_amount(recipient_public_key, amount, &blindings, &dst_cons, None)?;
 
     // Aggregated 16-bit range proof over the four limbs, DST = session_id ‖ 0x04.
     // Reuses the same blindings and shares G/H with the ciphertext commitments, so
@@ -272,9 +272,30 @@ pub struct PreparedAmount {
     pub limb_ciphertexts: [Ciphertext; 4],
     /// 256 bytes: four ciphertexts, each `commitment(32) || handle(32)`.
     pub encrypted_amount_bytes: Vec<u8>,
-    /// 128 bytes: ONE folded consistency proof over all four limbs,
+    /// 128 bytes: ONE folded consistency proof over all four limbs (plus the
+    /// caller's [`ExtraStatement`], when supplied),
     /// `a(32) || b(32) || z1(32) || z2(32)`.
     pub consistency_proof_bytes: Vec<u8>,
+}
+
+/// One additional statement folded into a [`prepare_amount`] consistency proof,
+/// appended AFTER the four limbs.
+///
+/// This exists so the sender's new-balance proof can cover the transfer total in
+/// the same fold. The on-chain verifier
+/// (`encrypted_amount.move::verify_encrypted_amount_and_encryption`) builds its
+/// statement vector as `limbs() ++ [encryption]` and verifies it with a SINGLE
+/// call, so a separate proof over the total does not satisfy it.
+#[derive(Clone, Copy)]
+pub struct ExtraStatement {
+    /// Commitment of the extra ciphertext (`H*message + G*blinding`).
+    pub commitment: RistrettoPoint,
+    /// Decryption handle of the extra ciphertext (`pk*blinding`).
+    pub decryption_handle: RistrettoPoint,
+    /// Plaintext of the extra ciphertext.
+    pub message: u64,
+    /// Randomness of the extra ciphertext.
+    pub blinding: RistrettoScalar,
 }
 
 /// Encrypt a `u64` amount to `public_key` as four 16-bit Twisted-ElGamal limbs
@@ -296,6 +317,7 @@ pub fn prepare_amount(
     amount: u64,
     blindings: &[RistrettoScalar; 4],
     dst_elgamal: &[u8],
+    extra: Option<ExtraStatement>,
 ) -> FastCryptoResult<PreparedAmount> {
     let mut encrypted_amount_bytes = Vec::with_capacity(256);
     let mut limb_ciphertexts: Vec<Ciphertext> = Vec::with_capacity(4);
@@ -327,12 +349,35 @@ pub fn prepare_amount(
         pysui_cts.push(pysui_ct);
     }
 
-    // ONE folded consistency proof over all four limbs. They share `public_key`, so
-    // the batched relation applies and what was four 128-byte per-limb proofs
-    // collapses to a single 128-byte proof.
-    let consistency_proof_bytes =
-        BatchedConsistencyProof::prove(dst_elgamal, public_key, &pysui_cts, &messages, blindings)?
-            .to_bytes();
+    // ONE folded consistency proof over all four limbs, plus `extra` when the caller
+    // supplies it. They share `public_key`, so the batched relation applies and what
+    // was four 128-byte per-limb proofs collapses to a single 128-byte proof.
+    //
+    // `extra` is appended AFTER the limbs because the on-chain verifier builds its
+    // statement vector the same way: `verify_encrypted_amount_and_encryption` does
+    // `limbs()` then `push_back(encryption)`. Slice order is part of the transcript,
+    // so this ordering is load-bearing — appending first would verify-fail while
+    // still type-checking.
+    let mut fold_cts = pysui_cts;
+    let mut fold_messages = messages.to_vec();
+    let mut fold_blindings = blindings.to_vec();
+    if let Some(extra) = extra {
+        fold_cts.push(cipher::Ciphertext {
+            commitment: extra.commitment,
+            decryption_handle: extra.decryption_handle,
+        });
+        fold_messages.push(extra.message);
+        fold_blindings.push(extra.blinding);
+    }
+
+    let consistency_proof_bytes = BatchedConsistencyProof::prove(
+        dst_elgamal,
+        public_key,
+        &fold_cts,
+        &fold_messages,
+        &fold_blindings,
+    )?
+    .to_bytes();
 
     let limb_ciphertexts: [Ciphertext; 4] = limb_ciphertexts
         .try_into()
@@ -623,7 +668,6 @@ pub struct BatchedTransferProofs {
     pub new_balance_amount: [u8; 256],
     pub range_proofs: Vec<Vec<u8>>,
     pub consistency_proofs: Vec<[u8; 128]>,
-    pub sender_total_consistency_proof: Vec<u8>,
     pub balance_proof: Vec<u8>,
     pub total_sender_handle: [u8; 32],
     pub seed_point: [u8; 32],
@@ -686,7 +730,7 @@ pub fn batched_transfer_proofs(
         let mut blindings_i: [RistrettoScalar; 4] = std::array::from_fn(|l| {
             randomness.blinding(i as u8, l as u8)
         });
-        let prepared = prepare_amount(recipient_pk, *amount, &blindings_i, &dst_elgamal)?;
+        let prepared = prepare_amount(recipient_pk, *amount, &blindings_i, &dst_elgamal, None)?;
 
         encrypted_amounts.push(prepared.encrypted_amount_bytes);
         consistency_proofs_vec.push(prepared.consistency_proof_bytes);
@@ -695,13 +739,62 @@ pub fn batched_transfer_proofs(
         blindings_i.zeroize();
     }
 
-    // Step 4: Prepare new balance with fresh random blindings
+    // Step 4: Reconstruct the transfer total BEFORE preparing the new balance.
+    //
+    // The chain folds the sender's four new-balance limbs AND the transfer total
+    // into ONE proof under the sender's key — `verify_encrypted_amount_and_encryption`
+    // builds `limbs() ++ [encryption]` (5 ciphertexts) and calls `verify_elgamal`
+    // once, unconditionally, at every recipient count. So the total must exist
+    // before the sender's fold is produced, not after it.
+    let total_amount: u64 = recipients
+        .iter()
+        .try_fold(0u64, |acc, (_, amt)| acc.checked_add(*amt))
+        .ok_or(FastCryptoError::InvalidInput)?;
+
+    // Collapse each recipient's four limb blindings by 16-bit limb weight, then sum
+    // across recipients. This is the randomness of the total the chain rebuilds as
+    // `sum_ciphertexts(receiver_amounts)`.
+    let weights: [RistrettoScalar; 4] = [
+        RistrettoScalar::from(1u64),
+        RistrettoScalar::from(1u64 << 16),
+        RistrettoScalar::from(1u64 << 32),
+        RistrettoScalar::from(1u64 << 48),
+    ];
+
+    let mut total_blinding = Zeroizing::new(RistrettoScalar::zero());
+    for (_, blindings) in amounts_in_order.iter().take(n) {
+        let mut collapsed_blinding_i = Zeroizing::new(RistrettoScalar::zero());
+        for (l, w) in weights.iter().enumerate() {
+            *collapsed_blinding_i += blindings[l] * (*w);
+        }
+        *total_blinding += *collapsed_blinding_i;
+    }
+
+    // Total sender ciphertext: commitment = h()*total_amount + g()*total_blinding;
+    // handle = sender_pk * total_blinding. The chain rebuilds this same value as
+    // `twisted_elgamal::new(sum_ciphertexts(&receiver_amounts), total_sender_handle)`.
+    let total_sender_commitment = h() * RistrettoScalar::from(total_amount) + g() * *total_blinding;
+    let total_sender_handle_point = *sender_public_key * *total_blinding;
+
+    // Step 5: Prepare new balance with fresh random blindings, folding the total in
+    // as the FIFTH statement so the proof matches the verifier's statement vector.
     let nb_blindings: Zeroizing<[RistrettoScalar; 4]> = Zeroizing::new(std::array::from_fn(|_| rand_scalar()));
-    let prepared_nb = prepare_amount(sender_public_key, new_balance, &nb_blindings, &dst_elgamal)?;
+    let prepared_nb = prepare_amount(
+        sender_public_key,
+        new_balance,
+        &nb_blindings,
+        &dst_elgamal,
+        Some(ExtraStatement {
+            commitment: total_sender_commitment,
+            decryption_handle: total_sender_handle_point,
+            message: total_amount,
+            blinding: *total_blinding,
+        }),
+    )?;
 
     consistency_proofs_vec.push(prepared_nb.consistency_proof_bytes.clone());
 
-    // Step 5: Append new balance to amounts in order
+    // Step 6: Append new balance to amounts in order
     amounts_in_order.push((new_balance, nb_blindings));
 
     // Per-transfer auditor package over the RECEIVERS ONLY — Move's
@@ -718,7 +811,7 @@ pub fn batched_transfer_proofs(
         None => (Vec::new(), Vec::new()),
     };
 
-    // Step 6: Prepare consistency_proofs return vector
+    // Step 7: Prepare consistency_proofs return vector
     let consistency_proofs: Vec<[u8; 128]> = consistency_proofs_vec
         .iter()
         .map(|cp| {
@@ -728,7 +821,7 @@ pub fn batched_transfer_proofs(
         })
         .collect();
 
-    // Step 7: Range proofs by chunk
+    // Step 8: Range proofs by chunk
     let sizes = batch_sizes(n + 1);
     let mut range_proofs = Vec::new();
     let mut start = 0;
@@ -762,60 +855,16 @@ pub fn batched_transfer_proofs(
         start += chunk_size;
     }
 
-    // Step 8: Total sender consistency proof
-    let total_amount: u64 = recipients
-        .iter()
-        .try_fold(0u64, |acc, (_, amt)| acc.checked_add(*amt))
-        .ok_or(FastCryptoError::InvalidInput)?;
-
-    // Build collapsed blinding per recipient, then sum for total
-    let weights: [RistrettoScalar; 4] = [
-        RistrettoScalar::from(1u64),
-        RistrettoScalar::from(1u64 << 16),
-        RistrettoScalar::from(1u64 << 32),
-        RistrettoScalar::from(1u64 << 48),
-    ];
-
-    let mut total_blinding = Zeroizing::new(RistrettoScalar::zero());
-    for (_, blindings) in amounts_in_order.iter().take(n) {
-        let mut collapsed_blinding_i = Zeroizing::new(RistrettoScalar::zero());
-        for (l, w) in weights.iter().enumerate() {
-            *collapsed_blinding_i += blindings[l] * (*w);
-        }
-        *total_blinding += *collapsed_blinding_i;
-    }
-
-    // Bridge sender_public_key to fastcrypto PublicKey for consistency proof
-    let sender_pk_fc: PublicKey =
-        bcs::from_bytes(&bcs::to_bytes(sender_public_key).expect("serialize sender_pk"))
-            .expect("sender_pk into PublicKey");
-
-    // Total sender ciphertext: commitment = h()*total_amount + g()*total_blinding;
-    // handle = sender_pk * total_blinding
-    let total_sender_commitment = h() * RistrettoScalar::from(total_amount) + g() * *total_blinding;
-    let total_sender_handle_point = *sender_public_key * *total_blinding;
-
-    let total_sender_ct = cipher::Ciphertext {
-        commitment: total_sender_commitment,
-        decryption_handle: total_sender_handle_point,
-    };
-    let total_sender_ct_fc: Ciphertext = bcs::from_bytes(&total_sender_ct.to_bytes())
-        .expect("total_sender ciphertext bridges to fastcrypto");
-
-    let total_sender_proof = ConsistencyProof::prove(
-        &RistrettoScalar::from(total_amount),
-        &total_sender_ct_fc,
-        &Blinding(*total_blinding),
-        &sender_pk_fc,
-        &dst_elgamal,
-        &mut thread_rng(),
-    )?;
-    let sender_total_consistency_proof = bcs::to_bytes(&total_sender_proof)
-        .expect("serialize total sender consistency proof");
-
+    // Step 9: Serialise the total's decryption handle.
+    //
+    // The separate sender-total ConsistencyProof that used to be built here is gone.
+    // The total is now the fifth statement of `consistency_proofs[n]` (Steps 4-5),
+    // which is what the chain actually verifies; a standalone proof over the total
+    // satisfies nothing on-chain. The handle itself is still required — the verifier
+    // needs it to rebuild the total's ciphertext.
     let total_sender_handle = total_sender_handle_point.to_byte_array();
 
-    // Step 9: Balance proof (residual encrypts zero)
+    // Step 10: Balance proof (residual encrypts zero)
     // Parse old_active_balance into 4 ciphertexts
     let old_limbs_vec: Vec<cipher::Ciphertext> = (0..4)
         .map(|l| cipher::Ciphertext::from_bytes(&old_active_balance[l * 64..(l + 1) * 64]))
@@ -841,7 +890,7 @@ pub fn batched_transfer_proofs(
     let balance_proof =
         prove_encrypts_zero(sender_private_key, sender_public_key, &residual_commitment, &residual_handle, &dst_ddh);
 
-    // Step 10: Assemble the return struct
+    // Step 11: Assemble the return struct
     let new_balance_amount_vec = prepared_nb.encrypted_amount_bytes;
     let mut new_balance_amount = [0u8; 256];
     new_balance_amount.copy_from_slice(&new_balance_amount_vec);
@@ -858,7 +907,6 @@ pub fn batched_transfer_proofs(
         new_balance_amount,
         range_proofs,
         consistency_proofs,
-        sender_total_consistency_proof,
         balance_proof,
         total_sender_handle,
         seed_point: seed_point.to_byte_array(),
@@ -1034,7 +1082,7 @@ mod tests {
         dst_elgamal.push(0x02);
 
         let prepared =
-            prepare_amount(&pk, amount, &blindings, &dst_elgamal).expect("prepare_amount");
+            prepare_amount(&pk, amount, &blindings, &dst_elgamal, None).expect("prepare_amount");
 
         // Wire lengths: 4 ciphertexts * 64, 4 consistency proofs * 128.
         assert_eq!(prepared.encrypted_amount_bytes.len(), 256);
@@ -1210,16 +1258,11 @@ mod tests {
         out
     }
 
-    /// Bridge a raw ristretto point into fastcrypto's `PublicKey` via its identical BCS form.
-    #[cfg(test)]
-    fn to_fc_pubkey(pk: &RistrettoPoint) -> PublicKey {
-        bcs::from_bytes(&bcs::to_bytes(pk).expect("serialize pk")).expect("pk into PublicKey")
-    }
-
     /// Full cryptographic verification of a `BatchedTransferProofs` output — the oracle
     /// that mirrors the on-chain Move verifier. Every proof is REALLY verified (not just
-    /// deserialized): range (verify_batch), per-limb consistency (ConsistencyProof::verify),
-    /// sender-total consistency, and the balance DDH proof (DdhTupleNizk::verify). The
+    /// deserialized): range (verify_batch), per-recipient folded consistency, the
+    /// sender's 5-statement fold (limbs ++ total), and the balance DDH proof
+    /// (DdhTupleNizk::verify). The
     /// receiver blindings are recovered from `seed_point` via `recover_transfer_randomness`,
     /// which is exactly the information the sender uses on-chain.
     #[cfg(test)]
@@ -1306,18 +1349,9 @@ mod tests {
                 "{label}: recipient {i} folded consistency verify failed",
             );
         }
-        // New balance (index N): key is sender pk.
-        {
-            let limbs: Vec<cipher::Ciphertext> = (0..4)
-                .map(|l| parse_limb(&proofs.new_balance_amount, l))
-                .collect();
-            let proof = BatchedConsistencyProof::from_bytes(&proofs.consistency_proofs[n])
-                .unwrap_or_else(|e| panic!("{label}: parse nb consistency: {e:?}"));
-            assert!(
-                proof.verify(&dst_elgamal, sender_pk, &limbs),
-                "{label}: new_balance folded consistency verify failed",
-            );
-        }
+        // The sender's own fold (index N) is NOT verified here. It covers five
+        // statements, and the fifth — the transfer total — is not reconstructable
+        // until the receiver blindings are recovered just below. See ASSERT 4.
 
         // Recover the receiver blindings from seed_point (what the sender does on-chain),
         // and recompute total_blinding = Σ_i Σ_l 2^(16l) * blinding(i,l) over RECEIVERS only.
@@ -1348,21 +1382,27 @@ mod tests {
             "{label}: reconstructed total_sender_handle must match composite output"
         );
 
-        // ── ASSERT 4: SENDER-TOTAL — really verify ConsistencyProof ─────────
+        // ── ASSERT 4: SENDER 5-FOLD — new-balance limbs ++ total, ONE proof ──
+        // Mirrors `encrypted_amount.move::verify_encrypted_amount_and_encryption`:
+        // the statement vector is the four new-balance limbs followed by the total,
+        // all under the sender's key, verified by a SINGLE folded proof. Order is
+        // part of the transcript, so the total must come last.
         {
-            let sender_pk_fc = to_fc_pubkey(sender_pk);
-            let total_ct = cipher::Ciphertext {
+            let mut limbs: Vec<cipher::Ciphertext> = (0..4)
+                .map(|l| parse_limb(&proofs.new_balance_amount, l))
+                .collect();
+            limbs.push(cipher::Ciphertext {
                 commitment: total_sender_commitment,
                 decryption_handle: total_sender_handle_point,
-            };
-            let total_ct_fc: Ciphertext =
-                bcs::from_bytes(&total_ct.to_bytes()).expect("total_ct into fastcrypto");
-            let proof: ConsistencyProof =
-                bcs::from_bytes(&proofs.sender_total_consistency_proof)
-                    .unwrap_or_else(|e| panic!("{label}: parse sender_total proof: {e:?}"));
-            proof
-                .verify(&total_ct_fc, &sender_pk_fc, &dst_elgamal)
-                .unwrap_or_else(|e| panic!("{label}: SENDER-TOTAL consistency verify FAILED: {e:?}"));
+            });
+            assert_eq!(limbs.len(), 5, "{label}: sender fold must be 5 statements");
+
+            let proof = BatchedConsistencyProof::from_bytes(&proofs.consistency_proofs[n])
+                .unwrap_or_else(|e| panic!("{label}: parse sender fold: {e:?}"));
+            assert!(
+                proof.verify(&dst_elgamal, sender_pk, &limbs),
+                "{label}: SENDER 5-fold consistency verify FAILED",
+            );
         }
 
         // ── ASSERT 5: BALANCE — really verify the DDH proof (residual == 0) ──

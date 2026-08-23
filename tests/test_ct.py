@@ -126,7 +126,7 @@ class TestEncryptDecryptInterop:
 
 class TestBatchedTransferProofs:
     def test_returns_named_dict_with_all_keys(self) -> None:
-        """Test that batched_transfer_proofs returns a dict with all 10 required keys."""
+        """Test that batched_transfer_proofs returns a dict with all 9 required keys."""
         sender = _keypair()
         recipient1 = _keypair()
         recipient2 = _keypair()
@@ -154,13 +154,12 @@ class TestBatchedTransferProofs:
             SESSION_ID,
         )
 
-        # Check all 10 keys are present
+        # Check all 9 keys are present
         expected_keys = {
             "encrypted_amounts",
             "new_balance_amount",
             "range_proofs",
             "consistency_proofs",
-            "sender_total_consistency_proof",
             "balance_proof",
             "total_sender_handle",
             "seed_point",
@@ -238,7 +237,6 @@ class TestBatchedTransferProofs:
         assert len(result["consistency_proofs"]) == 3
         assert all(len(cp) == 128 for cp in result["consistency_proofs"])
 
-        assert isinstance(result["sender_total_consistency_proof"], bytes)
         assert isinstance(result["balance_proof"], bytes)
         assert len(result["balance_proof"]) == 96
 

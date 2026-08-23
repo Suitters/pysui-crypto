@@ -244,11 +244,16 @@ fn unwrap_proofs<'py>(
 ///
 /// Returns `{"encrypted_amounts": list[bytes], "new_balance_amount": bytes(256),
 /// "range_proofs": list[bytes], "consistency_proofs": list[bytes(128)],
-/// "sender_total_consistency_proof": bytes, "balance_proof": bytes(96),
-/// "total_sender_handle": bytes(32), "seed_point": bytes(32),
-/// "auditor_handles": list[bytes(64)], "auditor_proof": bytes}`. Each entry in
-/// `consistency_proofs` is ONE proof folded over all four limbs, not four per-limb
-/// proofs concatenated.
+/// "balance_proof": bytes(96), "total_sender_handle": bytes(32),
+/// "seed_point": bytes(32), "auditor_handles": list[bytes(64)],
+/// "auditor_proof": bytes}`.
+///
+/// Each `consistency_proofs` entry is ONE folded proof, never per-limb proofs
+/// concatenated. Entries `0..N` each cover one recipient's four limbs. The LAST
+/// entry is the sender's and covers FIVE statements — the four new-balance limbs
+/// followed by the transfer total — which is what the chain verifies in a single
+/// call. `total_sender_handle` is still required: the verifier needs it to rebuild
+/// the total's ciphertext.
 ///
 /// `auditor_public_key` is optional. Omitted, `auditor_handles` is an empty list
 /// and `auditor_proof` is empty bytes — the explicit empty form, never `None`.
@@ -341,12 +346,6 @@ fn batched_transfer_proofs<'py>(
         .iter()
         .map(|ba| PyBytes::new(py, ba))
         .collect::<Vec<_>>())?)?;
-
-    // sender_total_consistency_proof: Vec<u8> -> bytes
-    dict.set_item(
-        "sender_total_consistency_proof",
-        PyBytes::new(py, &result.sender_total_consistency_proof),
-    )?;
 
     // balance_proof: Vec<u8> -> bytes
     dict.set_item("balance_proof", PyBytes::new(py, &result.balance_proof))?;

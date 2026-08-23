@@ -124,13 +124,16 @@ class BatchedTransferProofs(TypedDict):
     they are an empty list and empty bytes respectively, never ``None``. When one
     was supplied, ``auditor_handles`` holds one 64-byte ``lo || hi`` u32-limb
     handle pair per recipient (recipients only, never the sender's new balance)
-    and ``auditor_proof`` is ONE 128-byte ElGamal proof folded over all of them."""
+    and ``auditor_proof`` is ONE 128-byte ElGamal proof folded over all of them.
+
+    Each ``consistency_proofs`` entry is ONE folded proof. Entries ``0..N`` each
+    cover one recipient's four limbs; the LAST entry is the sender's and covers
+    FIVE statements — the four new-balance limbs followed by the transfer total."""
 
     encrypted_amounts: list[bytes]
     new_balance_amount: bytes
     range_proofs: list[bytes]
     consistency_proofs: list[bytes]
-    sender_total_consistency_proof: bytes
     balance_proof: bytes
     total_sender_handle: bytes
     seed_point: bytes
