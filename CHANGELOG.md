@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `batched_transfer_proofs` now returns 9 keys; both auditor keys are always present, empty when no auditor.
 - The last `consistency_proofs` entry, the sender's, folds five statements: the four new-balance limbs followed by the transfer total.
+- `build_release.yml` now publishes platform wheels to PyPI automatically via OIDC trusted publishing, instead of attaching them as zip archives to the GitHub release.
 
 ### Removed
 

@@ -8,10 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  REL_VERSION: ${{ github.event.release.tag_name }}
-  REL_REPO: ${{ github.event.repository.name }}
-
 jobs:
   linux:
     runs-on: ${{ matrix.platform.runner }}
@@ -24,7 +20,7 @@ jobs:
             manylinux: auto
           - runner: ubuntu-22.04
             target: aarch64
-            manylinux: manylinux_2_28
+            manylinux: auto
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -32,6 +28,8 @@ jobs:
           python-version: "3.10"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.platform.target == 'aarch64' && '-D__ARM_ARCH=8' || '' }}
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
@@ -97,31 +95,24 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     needs: [linux, windows, macos]
+    environment: pysui_crypto_build
     permissions:
       id-token: write
-      contents: write
       attestations: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: 'artifacts/*/*'
+          subject-path: 'dist/*'
 
-      - name: Zip artifacts
-        run: |
-          for dir in artifacts/wheels-*/; do
-            platform="${dir#artifacts/wheels-}"
-            platform="${platform%/}"
-            zip_name="${REL_REPO}-${REL_VERSION}-${platform}.zip"
-            (cd "$dir" && zip -r "../../${zip_name}" .)
-          done
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v3
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          files: "*.zip"
+          packages-dir: dist

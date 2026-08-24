@@ -17,27 +17,23 @@ Requirements
 Installation
 ------------
 
-From PyPI (sdist)
-~~~~~~~~~~~~~~~~~
+From PyPI
+~~~~~~~~~
 
-Only a source distribution is published to PyPI. Installing it requires a Rust toolchain and
-`maturin <https://www.maturin.rs>`_:
+Pre-built wheels are published to PyPI for Linux (x86_64, aarch64), Windows (x64), and macOS
+(x86_64, aarch64); ``pip`` selects the matching wheel automatically:
+
+.. code-block:: bash
+
+    pip install pysui-crypto
+
+On other platforms, ``pip`` falls back to the source distribution (sdist), which requires a
+Rust toolchain and `maturin <https://www.maturin.rs>`_:
 
 .. code-block:: bash
 
     pip install maturin
     pip install pysui-crypto
-
-Pre-built wheels
-~~~~~~~~~~~~~~~~
-
-Platform wheels for Linux (x86_64, aarch64), Windows (x64), and macOS (x86_64, aarch64) are
-attached to each `GitHub release <https://github.com/Suitters/pysui-crypto/releases>`_ as zip
-archives. Download the archive for your platform and install the wheel directly:
-
-.. code-block:: bash
-
-    pip install pysui_crypto-<version>-<platform>.whl
 
 Build from source
 ~~~~~~~~~~~~~~~~~
